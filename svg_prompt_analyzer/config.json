@@ -1,5 +1,5 @@
 {
-  "llm": {
+    "llm": {
       "provider": "local",
       "model": "mistralai/Mistral-7B-Instruct-v0.2",
       "quantization": "4bit",
@@ -9,22 +9,77 @@
       "max_batch_size": 8,
       "gradient_checkpointing": true,
       "performance": {
-          "prefetch_model_weights": true,
-          "num_workers": 4,
-          "context_length": 4096,
-          "kv_cache_enabled": true,
-          "half_precision_enabled": true
+        "prefetch_model_weights": true,
+        "num_workers": 4,
+        "context_length": 4096,
+        "kv_cache_enabled": true,
+        "half_precision_enabled": true
       }
-  },
-  "scene_elaboration": {
+    },
+    "clip": {
+      "model": "openai/clip-vit-large-patch14",
+      "device": "auto",
+      "cache_dir": ".cache/clip",
+      "batch_size": 8
+    },
+    "optimization": {
+      "model_pruning": {
+        "enabled": true,
+        "prune_amount": 0.2,
+        "structured_pruning": true,
+        "dynamic_sparsity": false,
+        "hardware_aware": true,
+        "cache_dir": ".cache/pruned_models"
+      },
+      "ppo": {
+        "enabled": true,
+        "state_dim": 64,
+        "action_dim": 16,
+        "hidden_dim": 128,
+        "learning_rate": 3e-4,
+        "gamma": 0.99,
+        "epsilon": 0.2,
+        "value_coef": 0.5,
+        "entropy_coef": 0.01,
+        "max_grad_norm": 0.5,
+        "update_epochs": 4,
+        "batch_size": 64,
+        "cache_dir": ".cache/ppo_models"
+      },
+      "multi_objective": {
+        "enabled": true,
+        "objectives": {
+          "clip_similarity": [0.6, true],
+          "svg_size": [0.2, false],
+          "visual_complexity": [0.1, true],
+          "rendering_performance": [0.1, false]
+        },
+        "population_size": 20,
+        "archive_size": 50,
+        "max_generations": 5,
+        "mutation_rate": 0.2,
+        "crossover_rate": 0.7,
+        "adaptation_rate": 0.1,
+        "scalarization_method": "weighted_sum",
+        "cache_dir": ".cache/multi_objective"
+      },
+      "batch_generation": {
+        "enabled": true,
+        "max_batch_size": 8,
+        "dynamic_batch_sizing": true,
+        "prefetch_next_batch": true,
+        "parallel_prefetch_workers": 2
+      }
+    },
+    "scene_elaboration": {
       "enabled": true,
       "use_caching": true,
       "cache_dir": ".cache/scene_elaboration",
       "reference_database": "data/visual_references.json",
       "max_cache_size": 500,
       "num_workers": 4
-  },
-  "system": {
+    },
+    "system": {
       "memory_efficient": true,
       "max_svg_size": 9500,
       "log_level": "INFO",
@@ -32,61 +87,26 @@
       "metrics_collection": true,
       "max_parallel_workers": 8,
       "gc_threshold": 0.8,
-      "auto_memory_optimization": true
-  },
-  "clip": {
-      "model": "openai/clip-vit-large-patch14",
-      "device": "auto",
-      "cache_dir": ".cache/clip",
-      "batch_size": 8
-  },
-  "optimization": {
-      "model_pruning": {
-          "enabled": true,
-          "prune_amount": 0.2,
-          "structured_pruning": true,
-          "dynamic_sparsity": false,
-          "hardware_aware": true,
-          "cache_dir": ".cache/pruned_models"
+      "auto_memory_optimization": true,
+      "memory_management": {
+        "gc_collect_frequency": 5,
+        "cuda_empty_cache_frequency": 3,
+        "memory_monitoring": true,
+        "memory_warning_threshold": 0.9,
+        "enable_weak_references": true,
+        "object_lifecycle_tracking": true
       },
-      "ppo": {
-          "enabled": true,
-          "state_dim": 64,
-          "action_dim": 16,
-          "hidden_dim": 128,
-          "learning_rate": 3e-4,
-          "gamma": 0.99,
-          "epsilon": 0.2,
-          "value_coef": 0.5,
-          "entropy_coef": 0.01,
-          "max_grad_norm": 0.5,
-          "update_epochs": 4,
-          "batch_size": 64,
-          "cache_dir": ".cache/ppo_models"
+      "io_optimization": {
+        "use_memory_mapping": true,
+        "async_file_operations": true,
+        "buffer_size": 8192,
+        "compression_level": 1
       },
-      "multi_objective": {
-          "enabled": true,
-          "objectives": {
-              "clip_similarity": [0.6, true],
-              "svg_size": [0.2, false],
-              "visual_complexity": [0.1, true],
-              "rendering_performance": [0.1, false]
-          },
-          "population_size": 20,
-          "archive_size": 50,
-          "max_generations": 5,
-          "mutation_rate": 0.2,
-          "crossover_rate": 0.7,
-          "adaptation_rate": 0.1,
-          "scalarization_method": "weighted_sum",
-          "cache_dir": ".cache/multi_objective"
-      },
-      "batch_generation": {
-          "enabled": true,
-          "max_batch_size": 8,
-          "dynamic_batch_sizing": true,
-          "prefetch_next_batch": true,
-          "parallel_prefetch_workers": 2
+      "threading": {
+        "use_thread_pool": true,
+        "max_threads": 16,
+        "task_queue_size": 100,
+        "thread_timeout_seconds": 300
       }
+    }
   }
-}
