@@ -1,1043 +1,952 @@
 """
-LLM Prompt Analyzer Module - Optimized
-========================
-This module uses an LLM to analyze text prompts and extract detailed information
-for SVG generation with enhanced semantic understanding, optimized for performance
-across different hardware platforms.
+Production-grade prompt analyzer for SVG generation.
+Provides optimized implementation for analyzing and enhancing text prompts
+to improve SVG generation results with memory and performance optimizations.
 """
 
-import json
-import logging
 import re
-import gc
-import threading
+import json
 import time
-from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Union, Set
-from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor
+import hashlib
+from typing import Dict, List, Tuple, Optional, Union, Any, Set
+from enum import Enum, auto
+from dataclasses import dataclass, field
 
-from svg_prompt_analyzer.analysis.prompt_analyzer import PromptAnalyzer
-from svg_prompt_analyzer.llm_integration.llm_manager import LLMManager
-from svg_prompt_analyzer.models.scene import Scene
-from svg_prompt_analyzer.models.visual_object import VisualObject, ObjectType
-from svg_prompt_analyzer.models.color import Color
-from svg_prompt_analyzer.models.material import Material
-from svg_prompt_analyzer.models.shape import Shape, Attribute
-from svg_prompt_analyzer.models.spatial import SpatialRelation
+# Import core optimizations
+from core import CONFIG, memoize, Profiler
+from utils.logger import get_logger, log_function_call
 
-logger = logging.getLogger(__name__)
+# Import LLM manager for prompt enhancement
+from llm_integration.llm_manager import (
+    LLMManager, ModelType, default_llm_manager, 
+    extract_json_from_text
+)
 
-class LLMPromptAnalyzer:
-    """
-    Enhanced prompt analyzer that uses an LLM to extract detailed information from text prompts.
-    This class augments the existing PromptAnalyzer with deeper semantic understanding,
-    optimized for cross-platform performance.
-    """
+# Configure logger
+logger = get_logger(__name__)
+
+# Type aliases
+PromptStr = str
+JsonDict = Dict[str, Any]
+
+
+class PromptCategory(Enum):
+    """Categories of prompts for SVG generation."""
+    SCENE = auto()         # Scene description
+    OBJECT = auto()        # Object description
+    STYLE = auto()         # Style description
+    CONCEPT = auto()       # Abstract concept
+    TECHNICAL = auto()     # Technical specification
+    AMBIGUOUS = auto()     # Unclear or ambiguous
+    COMPLEX = auto()       # Complex or compound
+    MINIMAL = auto()       # Minimal or simple
+
+
+@dataclass
+class PromptAnalysis:
+    """Analysis result for an SVG generation prompt."""
     
-    _instance = None
-    _lock = threading.Lock()
+    # Original prompt
+    original_prompt: str
     
-    def __new__(cls, *args, **kwargs):
-        """Implement singleton pattern for resource efficiency."""
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = super(LLMPromptAnalyzer, cls).__new__(cls)
-            return cls._instance
+    # Enhanced prompt
+    enhanced_prompt: Optional[str] = None
     
-    def __init__(self, 
-                 llm_manager: Optional[LLMManager] = None,
-                 use_fallback: bool = True,
-                 fallback_threshold: float = 0.7,
-                 cache_dir: str = ".cache/prompt_analysis",
-                 max_cache_size: int = 500,
-                 use_caching: bool = True,
-                 num_workers: int = 4,
-                 preload_model: bool = False):
-        """
-        Initialize the LLM-based prompt analyzer.
-        
-        Args:
-            llm_manager: LLM manager instance for model access
-            use_fallback: Whether to fall back to traditional analyzer if LLM fails
-            fallback_threshold: Confidence threshold below which fallback is triggered
-            cache_dir: Directory for analysis result caching
-            max_cache_size: Maximum number of cached analyses to keep
-            use_caching: Whether to cache analysis results
-            num_workers: Number of worker threads for parallel processing
-            preload_model: Whether to preload the LLM model at initialization
-        """
-        # Initialize only once (singleton pattern)
-        if hasattr(self, 'initialized'):
-            return
-            
-        self.llm_manager = llm_manager or LLMManager()
-        self.original_analyzer = PromptAnalyzer() if use_fallback else None
-        self.use_fallback = use_fallback
-        self.fallback_threshold = fallback_threshold
-        self.cache_dir = cache_dir
-        self.max_cache_size = max_cache_size
-        self.use_caching = use_caching
-        self.num_workers = min(num_workers, 16)  # Cap at reasonable maximum
-        
-        # Create cache directory
-        if self.use_caching:
-            Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Memory cache for recent analyses
-        self._analysis_cache = {}
-        
-        # Track model loading status
-        self.model_loaded = False
-        
-        # Thread pool for parallel tasks
-        self._executor = ThreadPoolExecutor(max_workers=self.num_workers)
-        
-        # Load the LLM model for prompt analysis if requested
-        if preload_model:
-            self.model_loaded = self.llm_manager.load_model("prompt_analyzer")
-            if not self.model_loaded:
-                logger.warning("Failed to preload LLM for prompt analysis. Will use fallback if enabled.")
-        
-        # Flag initialization complete
-        self.initialized = True
-        logger.info(f"LLM Prompt Analyzer initialized with fallback: {use_fallback}")
-        
-    def analyze_prompt(self, prompt_id: str, prompt_text: str) -> Scene:
-        """
-        Analyze a prompt using LLM-enhanced understanding to extract detailed scene information.
-        
-        Args:
-            prompt_id: Identifier for the prompt
-            prompt_text: Text of the prompt to analyze
-            
-        Returns:
-            Scene object containing all extracted information
-        """
-        # Check memory cache first
-        cache_key = self._get_cache_key(prompt_id, prompt_text)
-        if self.use_caching and cache_key in self._analysis_cache:
-            logger.info(f"Using cached analysis for prompt {prompt_id}")
-            return self._analysis_cache[cache_key]
-            
-        # Check disk cache if memory cache missed
-        if self.use_caching:
-            cached_scene = self._load_from_cache(cache_key)
-            if cached_scene:
-                logger.info(f"Loaded cached analysis from disk for prompt {prompt_id}")
-                # Update memory cache
-                self._analysis_cache[cache_key] = cached_scene
-                return cached_scene
-        
-        logger.info(f"Analyzing prompt {prompt_id} with LLM: {prompt_text}")
-        
-        # If LLM is not available and fallback is disabled, raise an error
-        if not self.model_loaded and not self.llm_manager.load_model("prompt_analyzer") and not self.use_fallback:
-            raise RuntimeError("LLM not available for prompt analysis and fallback is disabled")
-            
-        # If LLM is not available but fallback is enabled, use traditional analyzer
-        if not self.model_loaded and not self.llm_manager.load_model("prompt_analyzer") and self.use_fallback:
-            logger.info(f"Using fallback analyzer for prompt {prompt_id}")
-            scene = self.original_analyzer.analyze_prompt(prompt_id, prompt_text)
-            return scene
-            
-        start_time = time.time()
-        try:
-            # Generate the LLM prompt for scene analysis
-            llm_input = self._create_analysis_prompt(prompt_text)
-            
-            # Get response from LLM
-            llm_response = self.llm_manager.generate(
-                role="prompt_analyzer",
-                prompt=llm_input,
-                max_tokens=2048,
-                temperature=0.2,  # Low temperature for more deterministic analysis
-                stop_sequences=["</scene_analysis>"]
-            )
-            
-            # Parse the LLM response
-            scene_data = self._parse_llm_response(llm_response)
-            
-            # Calculate confidence score
-            confidence = self._calculate_confidence(scene_data)
-            
-            if confidence < self.fallback_threshold and self.use_fallback:
-                logger.warning(f"Low confidence in LLM analysis ({confidence:.2f}). Using fallback.")
-                scene = self.original_analyzer.analyze_prompt(prompt_id, prompt_text)
-            else:
-                # Create scene from parsed data
-                scene = self._create_scene(prompt_id, prompt_text, scene_data)
-                
-            analysis_time = time.time() - start_time
-            logger.info(f"Successfully analyzed prompt {prompt_id} in {analysis_time:.2f}s (confidence: {confidence:.2f})")
-            
-            # Cache the result
-            if self.use_caching:
-                self._save_to_cache(cache_key, scene)
-            
-            return scene
-            
-        except Exception as e:
-            logger.error(f"Error in LLM prompt analysis: {str(e)}")
-            
-            # Fall back to traditional analyzer if enabled
-            if self.use_fallback:
-                logger.info(f"Falling back to traditional analyzer for prompt {prompt_id}")
-                return self.original_analyzer.analyze_prompt(prompt_id, prompt_text)
-            else:
-                raise
-                
-    def batch_analyze(self, prompt_data: List[Dict[str, str]], 
-                      use_parallel: bool = True) -> Dict[str, Scene]:
-        """
-        Analyze multiple prompts efficiently.
-        
-        Args:
-            prompt_data: List of dictionaries with 'id' and 'description' keys
-            use_parallel: Whether to process prompts in parallel
-            
-        Returns:
-            Dictionary mapping prompt IDs to Scene objects
-        """
-        results = {}
-        
-        if use_parallel and len(prompt_data) > 1:
-            # Process in parallel
-            futures = {}
-            
-            for item in prompt_data:
-                prompt_id = item['id']
-                prompt_text = item['description']
-                
-                # Submit analysis task
-                future = self._executor.submit(self.analyze_prompt, prompt_id, prompt_text)
-                futures[future] = prompt_id
-                
-            # Collect results as they complete
-            for future in futures:
-                prompt_id = futures[future]
-                try:
-                    scene = future.result()
-                    results[prompt_id] = scene
-                except Exception as e:
-                    logger.error(f"Error analyzing prompt {prompt_id}: {str(e)}")
-                    # Use fallback for errors if enabled
-                    if self.use_fallback:
-                        logger.info(f"Using fallback for failed prompt {prompt_id}")
-                        results[prompt_id] = self.original_analyzer.analyze_prompt(prompt_id, prompt_data)
-        else:
-            # Process sequentially
-            for item in prompt_data:
-                prompt_id = item['id']
-                prompt_text = item['description']
-                
-                try:
-                    scene = self.analyze_prompt(prompt_id, prompt_text)
-                    results[prompt_id] = scene
-                except Exception as e:
-                    logger.error(f"Error analyzing prompt {prompt_id}: {str(e)}")
-                    # Use fallback for errors if enabled
-                    if self.use_fallback:
-                        logger.info(f"Using fallback for failed prompt {prompt_id}")
-                        results[prompt_id] = self.original_analyzer.analyze_prompt(prompt_id, prompt_text)
-                        
-        return results
-                
-    def _create_analysis_prompt(self, prompt_text: str) -> str:
-        """
-        Create a structured prompt for the LLM to analyze.
-        
-        Args:
-            prompt_text: Original prompt text
-            
-        Returns:
-            Formatted prompt for the LLM
-        """
-        return f"""You are an expert visual scene analyzer specialized in SVG generation. Your task is to analyze a text prompt and extract detailed information to create an SVG illustration.
-
-Here's how you should analyze the prompt:
-1. Identify all key objects in the prompt.
-2. Determine their visual properties (colors, materials, shapes, sizes).
-3. Understand spatial relationships between objects.
-4. Define the overall scene composition and background.
-5. Identify any special visual effects or patterns.
-
-For each object, provide:
-- Type: The category of object (geometric, nature, clothing, architecture, etc.)
-- Color: Detailed color information including hex codes when possible
-- Material: Any material properties mentioned or implied
-- Shape: Geometric shape or form of the object
-- Size: Relative size in the scene
-- Position: Where the object should be placed
-- Visual effects: Special visual characteristics
-
-Prompt to analyze: "{prompt_text}"
-
-Analyze this thoroughly and output in JSON format with the following structure:
-{{
-  "objects": [
-    {{
-      "name": "object name",
-      "type": "object type",
-      "color": "color name",
-      "hex_code": "#RRGGBB",
-      "material": "material name",
-      "shape": "shape name",
-      "position": "position description",
-      "size": "size description",
-      "visual_effects": "effects description"
-    }}
-  ],
-  "background": {{
-    "color": "background color",
-    "hex_code": "#RRGGBB"
-  }},
-  "composition": {{
-    "description": "scene composition description"
-  }},
-  "special_effects": ["effect1", "effect2"]
-}}
-
-<scene_analysis>
-"""
-        
-    def _parse_llm_response(self, llm_response: str) -> Dict[str, Any]:
-        """
-        Parse the LLM response into structured data.
-        
-        Args:
-            llm_response: Raw response from the LLM
-            
-        Returns:
-            Structured dictionary of scene information
-        """
-        # Ensure we only process content between tags if present
-        if "<scene_analysis>" in llm_response and "</scene_analysis>" in llm_response:
-            content = re.search(r'<scene_analysis>(.*?)</scene_analysis>', 
-                               llm_response, re.DOTALL)
-            if content:
-                llm_response = content.group(1).strip()
-        
-        # Try to find and parse JSON in the response
-        json_match = re.search(r'```json(.*?)```', llm_response, re.DOTALL) or re.search(r'```(.*?)```', llm_response, re.DOTALL)
-        if json_match:
-            try:
-                return json.loads(json_match.group(1).strip())
-            except json.JSONDecodeError:
-                logger.warning("Failed to parse JSON from LLM response")
-        
-        # Try to find JSON without code blocks
-        try:
-            # Look for JSON-like structure
-            json_like = re.search(r'(\{.*\})', llm_response, re.DOTALL)
-            if json_like:
-                potential_json = json_like.group(1)
-                return json.loads(potential_json)
-        except (json.JSONDecodeError, AttributeError):
-            logger.warning("Failed to parse JSON-like structure from LLM response")
-        
-        # If no JSON found or parsing failed, extract structured data from text
-        try:
-            return self._extract_structured_data(llm_response)
-        except Exception as e:
-            logger.error(f"Failed to extract structured data: {str(e)}")
-            return {"error": "Failed to parse LLM response", "raw_response": llm_response}
-            
-    def _extract_structured_data(self, text: str) -> Dict[str, Any]:
-        """
-        Extract structured data from text response when JSON parsing fails.
-        
-        Args:
-            text: Text to parse
-            
-        Returns:
-            Structured dictionary
-        """
-        result = {
-            "objects": [],
-            "background": {},
-            "composition": {},
-            "special_effects": []
+    # Parsed components
+    subject: Optional[str] = None
+    objects: List[str] = field(default_factory=list)
+    attributes: Dict[str, List[str]] = field(default_factory=dict)
+    colors: List[str] = field(default_factory=list)
+    style_cues: List[str] = field(default_factory=list)
+    
+    # Categorization
+    category: Optional[PromptCategory] = None
+    complexity: float = 0.0  # 0.0-1.0
+    
+    # Potential issues
+    issues: List[str] = field(default_factory=list)
+    suggestions: List[str] = field(default_factory=list)
+    
+    # Keywords for searching
+    keywords: List[str] = field(default_factory=list)
+    
+    # Performance metrics
+    processing_time: float = 0.0
+    
+    def to_dict(self) -> JsonDict:
+        """Convert analysis to dictionary."""
+        return {
+            "original_prompt": self.original_prompt,
+            "enhanced_prompt": self.enhanced_prompt,
+            "subject": self.subject,
+            "objects": self.objects,
+            "attributes": self.attributes,
+            "colors": self.colors,
+            "style_cues": self.style_cues,
+            "category": self.category.name if self.category else None,
+            "complexity": self.complexity,
+            "issues": self.issues,
+            "suggestions": self.suggestions,
+            "keywords": self.keywords,
+            "processing_time": self.processing_time
         }
-        
-        # Extract background information
-        bg_match = re.search(r'Background:?\s*(.*?)(?:\n\n|\n\w+:)', text, re.DOTALL)
-        if bg_match:
-            bg_text = bg_match.group(1).strip()
-            # Extract color
-            color_match = re.search(r'colou?r:?\s*([^,\n]+)', bg_text, re.IGNORECASE)
-            if color_match:
-                result["background"]["color"] = color_match.group(1).strip()
-            # Extract hex code if present
-            hex_match = re.search(r'#[0-9A-Fa-f]{6}', bg_text)
-            if hex_match:
-                result["background"]["hex_code"] = hex_match.group(0)
-        
-        # Extract objects
-        object_blocks = re.finditer(r'Object\s*\d*:?\s*(.*?)(?:\n\n|\n(?:Object|Background|Composition|Special Effects):)', 
-                                    text + "\n\nEND", re.DOTALL)
-        
-        for block in object_blocks:
-            obj_text = block.group(1).strip()
-            obj = {}
-            
-            # Extract object name
-            name_match = re.search(r'Name:?\s*([^,\n]+)', obj_text, re.IGNORECASE)
-            if name_match:
-                obj["name"] = name_match.group(1).strip()
-            else:
-                # Try to infer name from first line
-                first_line = obj_text.split('\n')[0].strip()
-                if ':' in first_line:
-                    obj["name"] = first_line.split(':', 1)[1].strip()
-                else:
-                    obj["name"] = first_line
-            
-            # Extract object type
-            type_match = re.search(r'Type:?\s*([^,\n]+)', obj_text, re.IGNORECASE)
-            if type_match:
-                obj["type"] = type_match.group(1).strip()
+    
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> 'PromptAnalysis':
+        """Create analysis from dictionary."""
+        # Convert category string to enum if present
+        category = None
+        if 'category' in data and data['category']:
+            try:
+                category = PromptCategory[data['category']]
+            except KeyError:
+                pass
                 
-            # Extract color
-            color_match = re.search(r'Colou?r:?\s*([^,\n]+)', obj_text, re.IGNORECASE)
-            if color_match:
-                obj["color"] = color_match.group(1).strip()
-                # Look for hex code
-                hex_match = re.search(r'#[0-9A-Fa-f]{6}', obj_text)
-                if hex_match:
-                    obj["hex_code"] = hex_match.group(0)
-                    
-            # Extract material
-            material_match = re.search(r'Material:?\s*([^,\n]+)', obj_text, re.IGNORECASE)
-            if material_match:
-                obj["material"] = material_match.group(1).strip()
-                
-            # Extract shape
-            shape_match = re.search(r'Shape:?\s*([^,\n]+)', obj_text, re.IGNORECASE)
-            if shape_match:
-                obj["shape"] = shape_match.group(1).strip()
-                
-            # Extract position
-            position_match = re.search(r'Position:?\s*([^,\n]+)', obj_text, re.IGNORECASE)
-            if position_match:
-                obj["position"] = position_match.group(1).strip()
-                
-            # Extract size
-            size_match = re.search(r'Size:?\s*([^,\n]+)', obj_text, re.IGNORECASE)
-            if size_match:
-                obj["size"] = size_match.group(1).strip()
-                
-            # Extract visual effects
-            effects_match = re.search(r'(Visual )?Effects:?\s*([^,\n]+)', obj_text, re.IGNORECASE)
-            if effects_match:
-                obj["visual_effects"] = effects_match.group(2).strip()
-                
-            # Add object to result if it has a name
-            if "name" in obj:
-                result["objects"].append(obj)
-                
-        # Extract composition
-        comp_match = re.search(r'Composition:?\s*(.*?)(?:\n\n|\n\w+:)', text, re.DOTALL)
-        if comp_match:
-            result["composition"]["description"] = comp_match.group(1).strip()
-            
-        # Extract special effects
-        effects_match = re.search(r'Special Effects:?\s*(.*?)(?:\n\n|$)', text, re.DOTALL)
-        if effects_match:
-            effects_text = effects_match.group(1).strip()
-            effects_list = [effect.strip() for effect in re.split(r'[,;-]\s*|\n+', effects_text) if effect.strip()]
-            result["special_effects"] = effects_list
-            
-        return result
-        
-    def _calculate_confidence(self, scene_data: Dict[str, Any]) -> float:
-        """
-        Calculate confidence score for the LLM analysis.
-        
-        Args:
-            scene_data: Parsed scene data from LLM
-            
-        Returns:
-            Confidence score (0.0 to 1.0)
-        """
-        confidence = 0.0
-        
-        # Check for errors
-        if "error" in scene_data:
-            return 0.0
-            
-        # More objects increases confidence
-        num_objects = len(scene_data.get("objects", []))
-        confidence += min(num_objects * 0.1, 0.5)
-        
-        # Check for essential object data
-        objects_with_color = sum(1 for obj in scene_data.get("objects", []) if "color" in obj)
-        objects_with_shape = sum(1 for obj in scene_data.get("objects", []) if "shape" in obj)
-        
-        if num_objects > 0:
-            color_ratio = objects_with_color / num_objects
-            shape_ratio = objects_with_shape / num_objects
-            confidence += color_ratio * 0.2
-            confidence += shape_ratio * 0.2
-            
-        # Background information increases confidence
-        if scene_data.get("background", {}).get("color"):
-            confidence += 0.1
-            
-        # Cap confidence at 1.0
-        return min(confidence, 1.0)
-        
-    def _create_scene(self, prompt_id: str, prompt_text: str, scene_data: Dict[str, Any]) -> Scene:
-        """
-        Create a Scene object from the parsed LLM response.
-        
-        Args:
-            prompt_id: Identifier for the prompt
-            prompt_text: Original prompt text
-            scene_data: Parsed scene data from LLM
-            
-        Returns:
-            Scene object with extracted information
-        """
-        # Create scene with background
-        background_color = "#FFFFFF"  # Default white
-        if "background" in scene_data and "hex_code" in scene_data["background"]:
-            background_color = scene_data["background"]["hex_code"]
-        elif "background" in scene_data and "color" in scene_data["background"]:
-            color_name = scene_data["background"]["color"]
-            color = Color(name=color_name)
-            background_color = color.hex_code
-            
-        scene = Scene(
-            id=prompt_id,
-            prompt=prompt_text,
-            background_color=background_color,
-            objects=[]
+        # Create instance with basic fields
+        analysis = cls(
+            original_prompt=data.get('original_prompt', ''),
+            enhanced_prompt=data.get('enhanced_prompt'),
+            subject=data.get('subject'),
+            objects=data.get('objects', []),
+            colors=data.get('colors', []),
+            style_cues=data.get('style_cues', []),
+            category=category,
+            complexity=data.get('complexity', 0.0),
+            issues=data.get('issues', []),
+            suggestions=data.get('suggestions', []),
+            keywords=data.get('keywords', []),
+            processing_time=data.get('processing_time', 0.0)
         )
         
-        # Add objects to scene using thread pool for parallel processing
-        if len(scene_data.get("objects", [])) > 5:
-            # Process objects in parallel for larger scenes
-            futures = {}
-            for i, obj_data in enumerate(scene_data.get("objects", [])):
-                obj_id = f"{prompt_id}_{i}"
-                futures[self._executor.submit(self._create_visual_object, obj_id, obj_data)] = i
-                
-            # Collect results and add to scene in original order
-            objects = [None] * len(futures)
-            for future in futures:
-                i = futures[future]
-                try:
-                    objects[i] = future.result()
-                except Exception as e:
-                    logger.error(f"Error creating visual object {i}: {str(e)}")
-                    
-            # Filter out None values (failed object creations)
-            scene.objects = [obj for obj in objects if obj is not None]
-        else:
-            # Process sequentially for smaller scenes
-            for i, obj_data in enumerate(scene_data.get("objects", [])):
-                visual_object = self._create_visual_object(f"{prompt_id}_{i}", obj_data)
-                scene.objects.append(visual_object)
+        # Add attributes if present
+        if 'attributes' in data:
+            analysis.attributes = data['attributes']
             
-        # Add patterns if needed
-        scene.patterns = self._create_patterns_for_scene(scene)
+        return analysis
+
+
+class PromptParser:
+    """
+    Parser for extracting structured information from text prompts.
+    
+    Uses regex patterns and basic NLP techniques to extract key components
+    from text prompts for SVG generation.
+    """
+    
+    # Common color terms for detection
+    COLOR_TERMS = [
+        # Basic colors
+        "red", "green", "blue", "yellow", "orange", "purple", "pink",
+        "brown", "black", "white", "gray", "grey", "cyan", "magenta",
+        "violet", "indigo", "teal", "maroon", "navy", "olive", "salmon",
+        "turquoise", "gold", "silver", "bronze", "copper",
         
-        # Apply special effects if any
-        for effect in scene_data.get("special_effects", []):
-            if "gradient" in effect.lower():
-                scene.defs.append(self._create_gradient_def())
-            elif "pattern" in effect.lower():
-                scene.defs.append(self._create_pattern_def())
-                
-        return scene
+        # Color modifiers
+        "dark", "light", "pale", "bright", "deep", "vivid",
+        "saturated", "desaturated", "muted", "vibrant",
         
-    def _create_visual_object(self, obj_id: str, obj_data: Dict[str, Any]) -> VisualObject:
+        # Color formats
+        "rgb", "rgba", "hex", "hsl", "hsla"
+    ]
+    
+    # Common style terms for detection
+    STYLE_TERMS = [
+        # Art styles
+        "minimalist", "abstract", "realistic", "cartoon", "sketch",
+        "3d", "flat", "geometric", "organic", "hand-drawn", "pixel art",
+        "vector", "isometric", "wireframe", "outline", "silhouette",
+        "gradient", "monochrome", "duotone", "watercolor", "oil painting",
+        
+        # Design styles
+        "modern", "retro", "vintage", "futuristic", "classic",
+        "industrial", "natural", "clean", "messy", "simple", "complex",
+        "detailed", "stylized", "decorative", "functional", "technical",
+        
+        # Visual effects
+        "shadow", "glow", "reflection", "transparency", "glossy", "matte",
+        "shiny", "textured", "pattern", "noise", "blur", "sharp"
+    ]
+    
+    def __init__(self):
+        """Initialize prompt parser."""
+        # Compile regex patterns for performance
+        self._color_pattern = self._compile_color_pattern()
+        self._style_pattern = self._compile_style_pattern()
+        
+        # Initialize keyword extractor
+        self._keyword_extractor = KeywordExtractor()
+    
+    @memoize
+    def _compile_color_pattern(self) -> re.Pattern:
         """
-        Create a VisualObject from object data.
+        Compile regex pattern for color detection.
+        
+        Returns:
+            Compiled regex pattern
+        """
+        # Color formats: names, hex, rgb/rgba, hsl/hsla
+        color_formats = [
+            r'#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?',  # Hex colors
+            r'rgb\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\)',  # RGB
+            r'rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*[\d.]+\s*\)',  # RGBA
+            r'hsl\(\s*\d+\s*,\s*\d+%?\s*,\s*\d+%?\s*\)',  # HSL
+            r'hsla\(\s*\d+\s*,\s*\d+%?\s*,\s*\d+%?\s*,\s*[\d.]+\s*\)'  # HSLA
+        ]
+        
+        # Add color names with word boundaries
+        for color in self.COLOR_TERMS:
+            color_formats.append(rf'\b{re.escape(color)}\b')
+            
+        # Build final pattern
+        pattern = '|'.join(color_formats)
+        return re.compile(pattern, re.IGNORECASE)
+    
+    @memoize
+    def _compile_style_pattern(self) -> re.Pattern:
+        """
+        Compile regex pattern for style detection.
+        
+        Returns:
+            Compiled regex pattern
+        """
+        # Build pattern from style terms with word boundaries
+        style_terms = [rf'\b{re.escape(style)}\b' for style in self.STYLE_TERMS]
+        pattern = '|'.join(style_terms)
+        return re.compile(pattern, re.IGNORECASE)
+    
+    def extract_colors(self, text: str) -> List[str]:
+        """
+        Extract color references from text.
         
         Args:
-            obj_id: Identifier for the object
-            obj_data: Object data from parsed LLM response
+            text: Text to analyze
             
         Returns:
-            VisualObject instance
+            List of color references
         """
-        # Determine object type
-        obj_type = ObjectType.ABSTRACT
-        if "type" in obj_data:
-            type_text = obj_data["type"].lower()
-            for enum_type in ObjectType:
-                if enum_type.value in type_text:
-                    obj_type = enum_type
-                    break
+        return [match.group(0).lower() for match in self._color_pattern.finditer(text)]
+    
+    def extract_style_cues(self, text: str) -> List[str]:
+        """
+        Extract style cues from text.
+        
+        Args:
+            text: Text to analyze
+            
+        Returns:
+            List of style cues
+        """
+        return [match.group(0).lower() for match in self._style_pattern.finditer(text)]
+    
+    def extract_objects(self, text: str) -> List[str]:
+        """
+        Extract object references from text.
+        
+        Args:
+            text: Text to analyze
+            
+        Returns:
+            List of object references
+        """
+        # Tokenize and extract noun phrases (simplified)
+        words = text.lower().split()
+        object_candidates = []
+        
+        # Common object-indicating patterns
+        patterns = [
+            r'(?:a|an|the)\s+([a-z]+(?:\s+[a-z]+){0,2})',
+            r'(?:\d+)\s+([a-z]+(?:\s+[a-z]+){0,2})'
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, text.lower())
+            object_candidates.extend(matches)
+            
+        # Add single words that might be objects (nouns)
+        for word in words:
+            # Skip common non-object words
+            if word in ["a", "an", "the", "with", "in", "on", "of", "and", "or"]:
+                continue
+                
+            # Skip color and style terms
+            if word in self.COLOR_TERMS or word in self.STYLE_TERMS:
+                continue
+                
+            # Add as potential object
+            if len(word) > 3:  # Skip very short words
+                object_candidates.append(word)
+                
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_objects = []
+        for obj in object_candidates:
+            if obj not in seen:
+                seen.add(obj)
+                unique_objects.append(obj)
+                
+        return unique_objects[:5]  # Limit to top 5
+    
+    def extract_attributes(self, text: str, objects: List[str]) -> Dict[str, List[str]]:
+        """
+        Extract attributes for objects.
+        
+        Args:
+            text: Text to analyze
+            objects: List of objects to find attributes for
+            
+        Returns:
+            Dictionary mapping objects to their attributes
+        """
+        attributes = {}
+        
+        for obj in objects:
+            # Find adjectives near object (simplified)
+            obj_pattern = rf'\b((?:\w+\s){{0,2}})({re.escape(obj)})(?:\s+(?:with|that|having|has)\s+([^,.]+))?'
+            matches = re.findall(obj_pattern, text.lower())
+            
+            obj_attributes = []
+            
+            for match in matches:
+                # Check for preceding adjectives
+                if match[0]:
+                    adj_candidates = match[0].strip().split()
+                    obj_attributes.extend(adj_candidates)
                     
-        # Create color if present
-        color = None
-        if "color" in obj_data:
-            color_name = obj_data["color"]
-            hex_code = obj_data.get("hex_code")
-            color = Color(name=color_name, hex_code=hex_code)
+                # Check for following attributes
+                if len(match) > 2 and match[2]:
+                    attr_text = match[2]
+                    # Extract key attributes
+                    attr_pattern = r'([a-z]+)'
+                    attr_candidates = re.findall(attr_pattern, attr_text)
+                    obj_attributes.extend(attr_candidates)
+                    
+            # Remove duplicates
+            obj_attributes = list(set(obj_attributes))
             
-        # Create material if present
-        material = None
-        if "material" in obj_data:
-            material_name = obj_data["material"]
-            material = Material(name=material_name, texture=material_name)
+            # Skip colors and style terms
+            obj_attributes = [
+                attr for attr in obj_attributes 
+                if attr not in self.COLOR_TERMS and attr not in self.STYLE_TERMS
+            ]
             
-        # Create shape if present
-        shapes = []
-        if "shape" in obj_data:
-            shape_type = obj_data["shape"].lower()
-            shape = Shape(
-                shape_type=shape_type,
-                attributes=[
-                    Attribute("fill", color.hex_code if color else "#808080"),
-                    Attribute("stroke", "#000000"),
-                    Attribute("stroke-width", 1)
-                ]
-            )
-            shapes.append(shape)
-            
-        # Determine position
-        position = (0.5, 0.5)  # Default center
-        if "position" in obj_data:
-            position_text = obj_data["position"].lower()
-            if "top" in position_text and "left" in position_text:
-                position = (0.25, 0.25)
-            elif "top" in position_text and "right" in position_text:
-                position = (0.75, 0.25)
-            elif "bottom" in position_text and "left" in position_text:
-                position = (0.25, 0.75)
-            elif "bottom" in position_text and "right" in position_text:
-                position = (0.75, 0.75)
-            elif "top" in position_text:
-                position = (0.5, 0.25)
-            elif "bottom" in position_text:
-                position = (0.5, 0.75)
-            elif "left" in position_text:
-                position = (0.25, 0.5)
-            elif "right" in position_text:
-                position = (0.75, 0.5)
+            if obj_attributes:
+                attributes[obj] = obj_attributes
                 
-        # Determine size
-        size = 0.2  # Default size
-        if "size" in obj_data:
-            size_text = obj_data["size"].lower()
-            if "large" in size_text or "big" in size_text:
-                size = 0.4
-            elif "small" in size_text or "tiny" in size_text:
-                size = 0.1
-            elif "medium" in size_text:
-                size = 0.2
-                
-        # Create visual object
-        visual_object = VisualObject(
-            id=obj_id,
-            name=obj_data.get("name", "Unknown Object"),
-            object_type=obj_type,
-            shapes=shapes,
-            color=color,
-            material=material,
-            position=position,
-            size=size
+        return attributes
+    
+    def extract_subject(self, text: str, objects: List[str]) -> Optional[str]:
+        """
+        Extract main subject from text.
+        
+        Args:
+            text: Text to analyze
+            objects: List of objects to consider
+            
+        Returns:
+            Main subject or None if not found
+        """
+        if not objects:
+            return None
+            
+        # Simple heuristic: first object or most mentioned
+        counts = {}
+        for obj in objects:
+            counts[obj] = text.lower().count(obj.lower())
+            
+        # Sort by count (descending) and then by position in original list
+        sorted_objects = sorted(
+            objects,
+            key=lambda x: (counts[x], -objects.index(x)),
+            reverse=True
         )
         
-        # Add visual effects if present
-        if "visual_effects" in obj_data:
-            effects_text = obj_data["visual_effects"].lower()
-            if "glow" in effects_text:
-                visual_object.add_visual_effect("glow")
-            if "shimmer" in effects_text:
-                visual_object.add_visual_effect("shimmering")
-            if "shadow" in effects_text:
-                visual_object.add_visual_effect("shadow")
-            if "gradient" in effects_text:
-                visual_object.add_visual_effect("gradient")
-            if "pattern" in effects_text:
-                visual_object.add_visual_effect("pattern")
-            if "texture" in effects_text:
-                visual_object.add_visual_effect("texture")
+        return sorted_objects[0] if sorted_objects else None
+    
+    def extract_keywords(self, text: str) -> List[str]:
+        """
+        Extract keywords for search and matching.
+        
+        Args:
+            text: Text to analyze
+            
+        Returns:
+            List of keywords
+        """
+        return self._keyword_extractor.extract_keywords(text)
+
+
+class KeywordExtractor:
+    """Extracts keywords from text for search and matching."""
+    
+    def __init__(self):
+        """Initialize keyword extractor."""
+        # Common stop words to exclude
+        self.stop_words = {
+            "a", "an", "the", "and", "or", "but", "if", "then", "else", "when",
+            "at", "from", "by", "on", "off", "for", "in", "out", "over", "under",
+            "again", "further", "then", "once", "here", "there", "when", "where",
+            "why", "how", "all", "any", "both", "each", "few", "more", "most",
+            "other", "some", "such", "no", "nor", "not", "only", "own", "same",
+            "so", "than", "too", "very", "can", "will", "just", "should", "now"
+        }
+    
+    @memoize
+    def extract_keywords(self, text: str, max_keywords: int = 10) -> List[str]:
+        """
+        Extract keywords from text.
+        
+        Args:
+            text: Text to extract keywords from
+            max_keywords: Maximum number of keywords to extract
+            
+        Returns:
+            List of keywords
+        """
+        # Tokenize and clean text
+        words = re.findall(r'\b\w+\b', text.lower())
+        
+        # Remove stop words
+        words = [word for word in words if word not in self.stop_words and len(word) > 2]
+        
+        # Count word frequencies
+        word_counts = {}
+        for word in words:
+            word_counts[word] = word_counts.get(word, 0) + 1
+            
+        # Sort by frequency (descending)
+        sorted_words = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)
+        
+        # Return top keywords
+        return [word for word, _ in sorted_words[:max_keywords]]
+
+
+class PromptAnalyzer:
+    """
+    Production-grade prompt analyzer for SVG generation.
+    
+    Analyzes and enhances text prompts for SVG generation using
+    a combination of rule-based techniques and LLM-based enhancement.
+    """
+    
+    def __init__(
+        self,
+        llm_manager: Optional[LLMManager] = None,
+        use_llm_enhancement: bool = True,
+        cache_results: bool = True,
+        cache_size: int = 100
+    ):
+        """
+        Initialize prompt analyzer.
+        
+        Args:
+            llm_manager: LLM manager for advanced analysis
+            use_llm_enhancement: Whether to use LLM for enhancement
+            cache_results: Whether to cache analysis results
+            cache_size: Maximum cache size
+        """
+        # Set up LLM manager
+        self.llm_manager = llm_manager or default_llm_manager
+        self.use_llm_enhancement = use_llm_enhancement
+        
+        # Set up parser
+        self.parser = PromptParser()
+        
+        # Set up cache
+        self.cache_results = cache_results
+        self._cache = {}
+        self._cache_size = cache_size
+    
+    @log_function_call()
+    def analyze(self, prompt: str) -> PromptAnalysis:
+        """
+        Analyze prompt for SVG generation.
+        
+        Args:
+            prompt: Text prompt to analyze
+            
+        Returns:
+            Prompt analysis results
+        """
+        # Check cache
+        if self.cache_results:
+            cache_key = self._create_cache_key(prompt)
+            if cache_key in self._cache:
+                return self._cache[cache_key]
                 
-        return visual_object
+        start_time = time.time()
         
-    def _create_patterns_for_scene(self, scene: Scene) -> Dict[str, str]:
-        """
-        Create patterns needed for the scene.
-        
-        Args:
-            scene: Scene object
+        with Profiler("prompt_analysis"):
+            # Create basic analysis
+            analysis = PromptAnalysis(original_prompt=prompt)
             
-        Returns:
-            Dictionary mapping pattern IDs to pattern code
-        """
-        patterns = {}
-        materials_seen: Set[str] = set()
-        effects_seen: Set[str] = set()
-        
-        # Process all objects to collect unique materials and effects
-        for obj in scene.objects:
-            # Check for materials
-            if obj.material and obj.material.texture:
-                materials_seen.add(obj.material.texture.lower())
+            # Extract basic components
+            analysis.colors = self.parser.extract_colors(prompt)
+            analysis.style_cues = self.parser.extract_style_cues(prompt)
+            analysis.objects = self.parser.extract_objects(prompt)
+            analysis.attributes = self.parser.extract_attributes(prompt, analysis.objects)
+            analysis.subject = self.parser.extract_subject(prompt, analysis.objects)
+            analysis.keywords = self.parser.extract_keywords(prompt)
+            
+            # Categorize prompt
+            analysis.category = self._categorize_prompt(prompt, analysis)
+            
+            # Calculate complexity
+            analysis.complexity = self._calculate_complexity(prompt, analysis)
+            
+            # Identify issues and suggestions
+            analysis.issues, analysis.suggestions = self._identify_issues(prompt, analysis)
+            
+            # Enhanced prompt (if enabled)
+            if self.use_llm_enhancement:
+                analysis.enhanced_prompt = self._enhance_prompt(prompt, analysis)
                 
-            # Check for visual effects
-            if hasattr(obj, 'visual_effects'):
-                for effect in obj.visual_effects:
-                    effects_seen.add(effect)
-        
-        # Create patterns for unique materials
-        for material in materials_seen:
-            if "silk" in material and "patternSilk" not in patterns:
-                patterns["patternSilk"] = self._create_silk_pattern(
-                    self._get_color_for_material(scene, "silk")
-                )
-            elif "wool" in material and "patternWool" not in patterns:
-                patterns["patternWool"] = self._create_wool_pattern(
-                    self._get_color_for_material(scene, "wool")
-                )
-            elif "corduroy" in material and "patternCorduroy" not in patterns:
-                patterns["patternCorduroy"] = self._create_corduroy_pattern(
-                    self._get_color_for_material(scene, "corduroy")
-                )
-            elif "fur" in material and "patternFur" not in patterns:
-                patterns["patternFur"] = self._create_fur_pattern(
-                    self._get_color_for_material(scene, "fur")
-                )
-        
-        # Create patterns for effects
-        for effect in effects_seen:
-            if effect == "shimmering" and "patternShimmering" not in patterns:
-                patterns["patternShimmering"] = self._create_shimmering_pattern(
-                    self._get_color_for_effect(scene, "shimmering")
-                )
-            elif effect == "ribbed" and "patternRibbed" not in patterns:
-                patterns["patternRibbed"] = self._create_ribbed_pattern(
-                    self._get_color_for_effect(scene, "ribbed")
-                )
-        
-        return patterns
+            # Record processing time
+            analysis.processing_time = time.time() - start_time
+            
+            # Cache result
+            if self.cache_results:
+                self._cache_result(cache_key, analysis)
+                
+            return analysis
     
-    def _get_color_for_material(self, scene: Scene, material_name: str) -> str:
+    @log_function_call()
+    def batch_analyze(self, prompts: List[str]) -> List[PromptAnalysis]:
         """
-        Get a color to use for a material pattern from objects using that material.
+        Analyze multiple prompts in batch.
         
         Args:
-            scene: Scene object
-            material_name: Material to find color for
+            prompts: List of prompts to analyze
             
         Returns:
-            Hex color code
+            List of analysis results
         """
-        for obj in scene.objects:
-            if obj.material and material_name in obj.material.texture.lower() and obj.color:
-                return obj.color.hex_code
-        return "#FFFFFF"  # Default white
+        results = []
+        
+        for prompt in prompts:
+            results.append(self.analyze(prompt))
+            
+        return results
     
-    def _get_color_for_effect(self, scene: Scene, effect_name: str) -> str:
+    @log_function_call()
+    def enhance_prompt(
+        self,
+        prompt: str,
+        target_tokens: int = 150,
+        add_details: bool = True,
+        add_style: bool = True
+    ) -> str:
         """
-        Get a color to use for an effect pattern.
+        Enhance prompt for better SVG generation.
         
         Args:
-            scene: Scene object
-            effect_name: Effect to find color for
+            prompt: Original prompt
+            target_tokens: Target token length for enhancement
+            add_details: Whether to add details
+            add_style: Whether to add style suggestions
             
         Returns:
-            Hex color code
+            Enhanced prompt
         """
-        for obj in scene.objects:
-            if hasattr(obj, 'visual_effects') and effect_name in obj.visual_effects and obj.color:
-                return obj.color.hex_code
-        return "#FFFFFF"  # Default white
-    
-    @lru_cache(maxsize=256)
-    def _create_silk_pattern(self, color: str) -> str:
-        """Create a silk-like pattern with the given color."""
-        return f'''
-<pattern id="patternSilk" patternUnits="userSpaceOnUse" width="20" height="20">
-    <rect width="20" height="20" fill="{color}" opacity="0.9"/>
-    <path d="M0,0 L20,20 M20,0 L0,20" stroke="#FFFFFF" stroke-width="0.5" opacity="0.7"/>
-</pattern>'''
-        
-    @lru_cache(maxsize=256)
-    def _create_wool_pattern(self, color: str) -> str:
-        """Create a wool-like pattern with the given color."""
-        return f'''
-<pattern id="patternWool" patternUnits="userSpaceOnUse" width="10" height="10">
-    <rect width="10" height="10" fill="{color}"/>
-    <path d="M0,0 Q2.5,2.5 5,0 Q7.5,2.5 10,0 M0,5 Q2.5,7.5 5,5 Q7.5,7.5 10,5" 
-          stroke="#FFFFFF" stroke-width="1" fill="none" opacity="0.5"/>
-</pattern>'''
-        
-    @lru_cache(maxsize=256)
-    def _create_corduroy_pattern(self, color: str) -> str:
-        """Create a corduroy-like pattern with the given color."""
-        return f'''
-<pattern id="patternCorduroy" patternUnits="userSpaceOnUse" width="8" height="8">
-    <rect width="8" height="8" fill="{color}"/>
-    <rect x="0" y="0" width="8" height="1" fill="#FFFFFF" opacity="0.3"/>
-    <rect x="0" y="3" width="8" height="1" fill="#FFFFFF" opacity="0.3"/>
-    <rect x="0" y="6" width="8" height="1" fill="#FFFFFF" opacity="0.3"/>
-</pattern>'''
-        
-    @lru_cache(maxsize=256)
-    def _create_fur_pattern(self, color: str) -> str:
-        """Create a fur-like pattern with the given color."""
-        return f'''
-<pattern id="patternFur" patternUnits="userSpaceOnUse" width="20" height="20">
-    <rect width="20" height="20" fill="{color}"/>
-    <path d="M5,0 L5,8 M10,0 L10,10 M15,0 L15,7 M0,5 L8,5 M0,10 L10,10 M0,15 L7,15" 
-          stroke="#FFFFFF" stroke-width="1.5" stroke-linecap="round" opacity="0.5"/>
-</pattern>'''
-        
-    @lru_cache(maxsize=256)
-    def _create_shimmering_pattern(self, color: str) -> str:
-        """Create a shimmering effect pattern with the given color."""
-        return f'''
-<pattern id="patternShimmering" patternUnits="userSpaceOnUse" width="40" height="40">
-    <rect width="40" height="40" fill="{color}"/>
-    <path d="M0,0 L40,40 M40,0 L0,40" stroke="#FFFFFF" stroke-width="0.5" opacity="0.6"/>
-    <path d="M20,0 L20,40 M0,20 L40,20" stroke="#FFFFFF" stroke-width="0.3" opacity="0.4"/>
-    <rect width="40" height="40" fill="url(#shimmerGradient)"/>
-</pattern>
-<linearGradient id="shimmerGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-    <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.2"/>
-    <stop offset="50%" stop-color="#FFFFFF" stop-opacity="0.1"/>
-    <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.2"/>
-</linearGradient>'''
-        
-    @lru_cache(maxsize=256)
-    def _create_ribbed_pattern(self, color: str) -> str:
-        """Create a ribbed pattern with the given color."""
-        return f'''
-<pattern id="patternRibbed" patternUnits="userSpaceOnUse" width="10" height="10">
-    <rect width="10" height="10" fill="{color}"/>
-    <rect x="0" y="0" width="10" height="2" fill="#000000" opacity="0.2"/>
-    <rect x="0" y="4" width="10" height="2" fill="#000000" opacity="0.2"/>
-    <rect x="0" y="8" width="10" height="2" fill="#000000" opacity="0.2"/>
-</pattern>'''
-        
-    @lru_cache(maxsize=256)
-    def _create_gradient_def(self) -> str:
-        """Create a default gradient definition."""
-        return '''
-<linearGradient id="defaultGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-    <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.9"/>
-    <stop offset="100%" stop-color="#000000" stop-opacity="0.2"/>
-</linearGradient>'''
-        
-    @lru_cache(maxsize=256)
-    def _create_pattern_def(self) -> str:
-        """Create a default pattern definition."""
-        return '''
-<pattern id="defaultPattern" patternUnits="userSpaceOnUse" width="10" height="10">
-    <rect width="10" height="10" fill="#FFFFFF"/>
-    <circle cx="5" cy="5" r="2" fill="#000000" opacity="0.5"/>
-</pattern>'''
-    
-    def _get_cache_key(self, prompt_id: str, prompt_text: str) -> str:
-        """Generate a cache key for the prompt."""
-        import hashlib
-        return hashlib.md5(f"{prompt_id}:{prompt_text}".encode()).hexdigest()
-    
-    def _save_to_cache(self, cache_key: str, scene: Scene) -> None:
-        """Save a scene to both memory and disk cache."""
-        try:
-            # Update memory cache
-            self._analysis_cache[cache_key] = scene
+        with Profiler("prompt_enhancement"):
+            # Analyze prompt
+            analysis = self.analyze(prompt)
             
-            # Limit memory cache size
-            if len(self._analysis_cache) > self.max_cache_size:
-                # Remove a random key to avoid synchronized removals in parallel processing
-                keys = list(self._analysis_cache.keys())
-                if len(keys) > 0:
-                    random_key = keys[0]  # Take the first (oldest) key
-                    self._analysis_cache.pop(random_key, None)
+            # Use enhanced prompt if already generated
+            if analysis.enhanced_prompt:
+                return analysis.enhanced_prompt
+                
+            # Generate enhanced prompt with LLM
+            system_prompt = """You are an expert SVG designer. Your task is to enhance user prompts for SVG image generation. 
+            Clarify vague terms, add relevant details, and suggest specific visual styles. Be concise but specific. 
+            Focus on visual elements that can be represented in SVG. Return only the enhanced prompt text without explanations."""
             
-            # Save to disk cache
-            cache_path = Path(self.cache_dir) / f"{cache_key}.json"
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"""Enhance this prompt for SVG generation. Keep the core meaning but add visual details and clarity:
+                
+                Original prompt: "{prompt}"
+                
+                - Target length: ~{target_tokens} tokens
+                - Add descriptive details: {'Yes' if add_details else 'No'}
+                - Add style suggestions: {'Yes' if add_style else 'No'}
+                - Focus on what can be represented in SVG
+                
+                Enhanced prompt:"""}
+            ]
             
-            # Serialize scene to dict
-            scene_dict = {
-                "id": scene.id,
-                "prompt": scene.prompt,
-                "background_color": scene.background_color,
-                "width": scene.width,
-                "height": scene.height,
-                "patterns": scene.patterns,
-                "objects": []
+            try:
+                response = self.llm_manager.complete_sync(
+                    messages,
+                    model_type=ModelType.GPT_3_5_TURBO,
+                    temperature=0.7,
+                    max_tokens=300
+                )
+                
+                enhanced = response.get("content", "").strip()
+                
+                # Clean up response format if needed
+                if enhanced.startswith('"') and enhanced.endswith('"'):
+                    enhanced = enhanced[1:-1]
+                    
+                # Fall back to original if enhancement failed
+                if not enhanced:
+                    enhanced = prompt
+                    
+                return enhanced
+                
+            except Exception as e:
+                logger.error(f"Error enhancing prompt: {str(e)}")
+                return prompt
+    
+    def get_structured_prompt(self, text: str) -> JsonDict:
+        """
+        Convert text prompt to structured format.
+        
+        Args:
+            text: Text prompt
+            
+        Returns:
+            Structured prompt as JSON dictionary
+        """
+        with Profiler("structured_prompt"):
+            # Analyze prompt
+            analysis = self.analyze(text)
+            
+            # Build structured prompt
+            structured = {
+                "subject": analysis.subject or "",
+                "elements": [],
+                "style": {
+                    "colors": analysis.colors,
+                    "style_cues": analysis.style_cues
+                }
             }
             
-            # Add objects
-            for obj in scene.objects:
-                obj_dict = {
-                    "id": obj.id,
-                    "name": obj.name,
-                    "object_type": obj.object_type.value,
-                    "position": obj.position,
-                    "size": obj.size,
-                    "z_index": obj.z_index,
+            # Add elements based on objects
+            for obj in analysis.objects:
+                element = {
+                    "type": obj,
+                    "attributes": analysis.attributes.get(obj, [])
                 }
+                structured["elements"].append(element)
                 
-                # Add color
-                if obj.color:
-                    obj_dict["color"] = {
-                        "name": obj.color.name,
-                        "hex_code": obj.color.hex_code
-                    }
-                
-                # Add material
-                if obj.material:
-                    obj_dict["material"] = {
-                        "name": obj.material.name,
-                        "texture": obj.material.texture,
-                        "transparency": obj.material.transparency
-                    }
-                
-                # Add shapes
-                if obj.shapes:
-                    obj_dict["shapes"] = []
-                    for shape in obj.shapes:
-                        shape_dict = {
-                            "shape_type": shape.shape_type,
-                            "attributes": [{"name": attr.name, "value": attr.value} for attr in shape.attributes],
-                            "visual_effects": shape.visual_effects
-                        }
-                        if shape.rotation is not None:
-                            shape_dict["rotation"] = shape.rotation
-                        obj_dict["shapes"].append(shape_dict)
-                
-                # Add visual effects
-                if hasattr(obj, 'visual_effects') and obj.visual_effects:
-                    obj_dict["visual_effects"] = obj.visual_effects
-                
-                scene_dict["objects"].append(obj_dict)
-            
-            # Write to disk asynchronously
-            self._executor.submit(self._write_cache_file, cache_path, scene_dict)
-            
-        except Exception as e:
-            logger.error(f"Error saving scene to cache: {str(e)}")
+            return structured
     
-    def _write_cache_file(self, path: Path, data: Dict[str, Any]) -> None:
-        """Write data to cache file."""
-        try:
-            with open(path, 'w') as f:
-                json.dump(data, f)
-        except Exception as e:
-            logger.error(f"Error writing cache file {path}: {str(e)}")
-    
-    def _load_from_cache(self, cache_key: str) -> Optional[Scene]:
+    def _create_cache_key(self, prompt: str) -> str:
         """
-        Load a scene from disk cache.
+        Create cache key for a prompt.
         
         Args:
-            cache_key: Cache key to load
+            prompt: Prompt to create key for
             
         Returns:
-            Scene object or None if not cached
+            Cache key
         """
-        cache_path = Path(self.cache_dir) / f"{cache_key}.json"
-        if not cache_path.exists():
-            return None
+        return hashlib.md5(prompt.encode('utf-8')).hexdigest()
+    
+    def _cache_result(self, key: str, analysis: PromptAnalysis) -> None:
+        """
+        Cache analysis result.
+        
+        Args:
+            key: Cache key
+            analysis: Analysis result to cache
+        """
+        # Add to cache
+        self._cache[key] = analysis
+        
+        # Prune cache if needed
+        if len(self._cache) > self._cache_size:
+            # Remove random 25% of entries (simple approach)
+            keys_to_remove = list(self._cache.keys())[:len(self._cache) // 4]
+            for k in keys_to_remove:
+                del self._cache[k]
+    
+    def _categorize_prompt(self, prompt: str, analysis: PromptAnalysis) -> PromptCategory:
+        """
+        Categorize prompt.
+        
+        Args:
+            prompt: Original prompt
+            analysis: Current analysis results
             
+        Returns:
+            Prompt category
+        """
+        # Check for scene indicators
+        scene_indicators = ["scene", "landscape", "background", "environment"]
+        if any(indicator in prompt.lower() for indicator in scene_indicators):
+            return PromptCategory.SCENE
+            
+        # Check for style focus
+        if len(analysis.style_cues) > 3:
+            return PromptCategory.STYLE
+            
+        # Check for technical specifications
+        technical_indicators = ["pixels", "resolution", "aspect ratio", "dimensions", "viewbox", "canvas"]
+        if any(indicator in prompt.lower() for indicator in technical_indicators):
+            return PromptCategory.TECHNICAL
+            
+        # Check complexity
+        word_count = len(prompt.split())
+        if word_count < 5:
+            return PromptCategory.MINIMAL
+        elif word_count > 20:
+            return PromptCategory.COMPLEX
+            
+        # Check for ambiguity
+        ambiguous_terms = ["something", "anything", "whatever", "like", "maybe", "sort of", "kind of"]
+        if any(term in prompt.lower() for term in ambiguous_terms):
+            return PromptCategory.AMBIGUOUS
+            
+        # Default: if we have objects, it's an object prompt
+        if analysis.objects:
+            return PromptCategory.OBJECT
+            
+        # Fallback for abstract concepts
+        return PromptCategory.CONCEPT
+    
+    def _calculate_complexity(self, prompt: str, analysis: PromptAnalysis) -> float:
+        """
+        Calculate prompt complexity score.
+        
+        Args:
+            prompt: Original prompt
+            analysis: Current analysis results
+            
+        Returns:
+            Complexity score (0.0-1.0)
+        """
+        # Factors affecting complexity
+        factors = {
+            "length": min(1.0, len(prompt) / 200),  # Length factor
+            "objects": min(1.0, len(analysis.objects) / 5),  # Number of objects
+            "colors": min(1.0, len(analysis.colors) / 4),  # Number of colors
+            "styles": min(1.0, len(analysis.style_cues) / 3),  # Number of style cues
+            "attributes": min(1.0, sum(len(attrs) for attrs in analysis.attributes.values()) / 10)  # Attributes
+        }
+        
+        # Additional complexity indicators
+        if "gradient" in prompt.lower():
+            factors["gradient"] = 0.2
+            
+        if "pattern" in prompt.lower():
+            factors["pattern"] = 0.2
+            
+        if any(term in prompt.lower() for term in ["3d", "perspective", "isometric"]):
+            factors["dimension"] = 0.3
+            
+        # Calculate weighted score
+        weights = {
+            "length": 0.1,
+            "objects": 0.3,
+            "colors": 0.15,
+            "styles": 0.15,
+            "attributes": 0.2,
+            "gradient": 1.0,
+            "pattern": 1.0,
+            "dimension": 1.0
+        }
+        
+        score = sum(factors.get(factor, 0) * weights.get(factor, 0) for factor in factors)
+        
+        # Normalize to 0.0-1.0
+        normalized_score = min(1.0, score / sum(weights.get(factor, 0) for factor in factors))
+        
+        return normalized_score
+    
+    def _identify_issues(
+        self,
+        prompt: str,
+        analysis: PromptAnalysis
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Identify issues and suggestions for prompt.
+        
+        Args:
+            prompt: Original prompt
+            analysis: Current analysis results
+            
+        Returns:
+            Tuple of (issues, suggestions)
+        """
+        issues = []
+        suggestions = []
+        
+        # Check for minimal prompts
+        if len(prompt.split()) < 3:
+            issues.append("Prompt is too brief")
+            suggestions.append("Add more descriptive details")
+            
+        # Check for missing subject
+        if not analysis.subject and not analysis.objects:
+            issues.append("No clear subject identified")
+            suggestions.append("Specify what should be the main element of the SVG")
+            
+        # Check for missing colors
+        if not analysis.colors:
+            issues.append("No color information")
+            suggestions.append("Specify colors for better results")
+            
+        # Check for missing style
+        if not analysis.style_cues:
+            issues.append("No style information")
+            suggestions.append("Add style guidance (e.g., 'minimalist', 'geometric')")
+            
+        # Check for ambiguity
+        ambiguous_terms = ["something", "anything", "whatever", "like", "maybe", "sort of", "kind of"]
+        found_ambiguous = [term for term in ambiguous_terms if term in prompt.lower()]
+        if found_ambiguous:
+            issues.append(f"Ambiguous terms: {', '.join(found_ambiguous)}")
+            suggestions.append("Replace ambiguous terms with specific descriptions")
+            
+        # Check for complex prompts
+        if analysis.complexity > 0.8:
+            issues.append("Prompt may be too complex for SVG generation")
+            suggestions.append("Consider simplifying or breaking into separate components")
+            
+        # Check for 3D references
+        if any(term in prompt.lower() for term in ["3d", "realistic", "photorealistic"]):
+            issues.append("SVG format has limitations with 3D and photorealistic effects")
+            suggestions.append("Consider focusing on 2D vector-friendly elements")
+            
+        # Check for animation references
+        if any(term in prompt.lower() for term in ["animate", "animation", "moving"]):
+            issues.append("Basic SVG generation typically does not include animation")
+            suggestions.append("Focus on static elements and apply animation separately")
+            
+        return issues, suggestions
+    
+    def _enhance_prompt(self, prompt: str, analysis: PromptAnalysis) -> str:
+        """
+        Enhance prompt using LLM.
+        
+        Args:
+            prompt: Original prompt
+            analysis: Current analysis results
+            
+        Returns:
+            Enhanced prompt or original if enhancement fails
+        """
         try:
-            with open(cache_path, 'r') as f:
-                scene_dict = json.load(f)
-                
-            # Reconstruct scene
-            scene = Scene(
-                id=scene_dict["id"],
-                prompt=scene_dict["prompt"],
-                background_color=scene_dict["background_color"],
-                width=scene_dict["width"],
-                height=scene_dict["height"],
-                patterns=scene_dict.get("patterns", {})
+            return self.enhance_prompt(
+                prompt,
+                target_tokens=150,
+                add_details=True,
+                add_style=True
             )
+        except Exception as e:
+            logger.error(f"Error in LLM prompt enhancement: {str(e)}")
+            return prompt
+    
+    def analyze_with_llm(self, prompt: str) -> JsonDict:
+        """
+        Perform deep analysis using LLM.
+        
+        Args:
+            prompt: Text prompt to analyze
             
-            # Add objects
-            for obj_dict in scene_dict.get("objects", []):
-                # Create color if present
-                color = None
-                if "color" in obj_dict:
-                    color_dict = obj_dict["color"]
-                    color = Color(
-                        name=color_dict["name"],
-                        hex_code=color_dict.get("hex_code")
-                    )
-                
-                # Create material if present
-                material = None
-                if "material" in obj_dict:
-                    material_dict = obj_dict["material"]
-                    material = Material(
-                        name=material_dict["name"],
-                        texture=material_dict.get("texture"),
-                        transparency=material_dict.get("transparency", 0.0)
-                    )
-                
-                # Create shapes
-                shapes = []
-                for shape_dict in obj_dict.get("shapes", []):
-                    shape = Shape(
-                        shape_type=shape_dict["shape_type"],
-                        attributes=[
-                            Attribute(attr["name"], attr["value"]) 
-                            for attr in shape_dict.get("attributes", [])
-                        ],
-                        visual_effects=shape_dict.get("visual_effects", {})
-                    )
-                    if "rotation" in shape_dict:
-                        shape.rotation = shape_dict["rotation"]
-                    shapes.append(shape)
-                
-                # Create object
-                visual_object = VisualObject(
-                    id=obj_dict["id"],
-                    name=obj_dict["name"],
-                    object_type=ObjectType(obj_dict["object_type"]),
-                    shapes=shapes,
-                    color=color,
-                    material=material,
-                    position=tuple(obj_dict["position"]),
-                    size=obj_dict["size"],
-                    z_index=obj_dict["z_index"]
+        Returns:
+            Detailed analysis as JSON dictionary
+        """
+        if not self.use_llm_enhancement:
+            # Return rule-based analysis if LLM enhancement disabled
+            return self.analyze(prompt).to_dict()
+            
+        with Profiler("llm_prompt_analysis"):
+            # System prompt for analysis
+            system_prompt = """You are an expert SVG designer analyzing prompts for SVG generation. 
+            Extract structured information from the prompt to help generate better SVG images.
+            Return your analysis as a JSON object with the following fields:
+            - subject: The main subject/focus of the prompt
+            - objects: Array of objects/elements mentioned
+            - attributes: Object containing attributes for each object
+            - colors: Array of color references
+            - style_cues: Array of style indicators
+            - category: One of "SCENE", "OBJECT", "STYLE", "CONCEPT", "TECHNICAL", "AMBIGUOUS", "COMPLEX", "MINIMAL"
+            - complexity: Number from 0.0-1.0 indicating prompt complexity
+            - issues: Array of potential issues with the prompt
+            - suggestions: Array of suggestions to improve the prompt
+            - keywords: Array of relevant keywords for the prompt
+            
+            Be concise and focus only on visual elements that can be represented in SVG."""
+            
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f'Analyze this prompt for SVG generation: "{prompt}"'}
+            ]
+            
+            try:
+                response = self.llm_manager.complete_sync(
+                    messages,
+                    model_type=ModelType.GPT_3_5_TURBO,
+                    temperature=0.3,
+                    max_tokens=1000
                 )
                 
-                # Add visual effects
-                if "visual_effects" in obj_dict:
-                    for effect, value in obj_dict["visual_effects"].items():
-                        visual_object.add_visual_effect(effect, value)
+                content = response.get("content", "")
                 
-                scene.objects.append(visual_object)
+                # Extract JSON from response
+                result = extract_json_from_text(content)
                 
-            return scene
-            
-        except Exception as e:
-            logger.error(f"Error loading scene from cache: {str(e)}")
-            # Remove corrupted cache file
-            try:
-                cache_path.unlink(missing_ok=True)
-            except:
-                pass
-            return None
+                if not result:
+                    # Fall back to rule-based analysis
+                    logger.warning("LLM did not return valid JSON, falling back to rule-based analysis")
+                    return self.analyze(prompt).to_dict()
+                    
+                # Fill in missing fields with rule-based analysis
+                rule_based = self.analyze(prompt).to_dict()
+                for key in rule_based:
+                    if key not in result or not result[key]:
+                        result[key] = rule_based[key]
+                        
+                return result
+                
+            except Exception as e:
+                logger.error(f"Error in LLM prompt analysis: {str(e)}")
+                # Fall back to rule-based analysis
+                return self.analyze(prompt).to_dict()
+
+
+# Create singleton instance for easy import
+default_prompt_analyzer = PromptAnalyzer()
+
+
+# Utility functions for direct use
+def analyze_prompt(prompt: str) -> PromptAnalysis:
+    """
+    Analyze a prompt for SVG generation.
     
-    def clear_cache(self) -> None:
-        """Clear both memory and disk caches."""
-        # Clear memory cache
-        self._analysis_cache.clear()
+    Args:
+        prompt: Text prompt to analyze
         
-        # Clear disk cache
-        try:
-            for cache_file in Path(self.cache_dir).glob("*.json"):
-                try:
-                    cache_file.unlink()
-                except:
-                    pass
-        except Exception as e:
-            logger.error(f"Error clearing disk cache: {str(e)}")
+    Returns:
+        Prompt analysis
+    """
+    return default_prompt_analyzer.analyze(prompt)
+
+
+def enhance_prompt(prompt: str) -> str:
+    """
+    Enhance a prompt for better SVG generation.
     
-    def shutdown(self) -> None:
-        """Cleanup resources and shut down the analyzer."""
-        self._executor.shutdown(wait=True)
-        gc.collect()
+    Args:
+        prompt: Original prompt
+        
+    Returns:
+        Enhanced prompt
+    """
+    return default_prompt_analyzer.enhance_prompt(prompt)
+
+
+def get_structured_prompt(prompt: str) -> JsonDict:
+    """
+    Convert text prompt to structured format.
+    
+    Args:
+        prompt: Text prompt
+        
+    Returns:
+        Structured prompt as JSON dictionary
+    """
+    return default_prompt_analyzer.get_structured_prompt(prompt)

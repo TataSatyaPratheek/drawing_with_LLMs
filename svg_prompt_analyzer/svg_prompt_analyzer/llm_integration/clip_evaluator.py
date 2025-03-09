@@ -1,915 +1,981 @@
 """
-CLIP Evaluator Module - Optimized
-==================
-This module provides highly optimized functionality for evaluating SVG-text similarity 
-using CLIP models with cross-platform hardware acceleration.
+Production-grade CLIP-based evaluator for image-text matching.
+Provides optimized implementation for evaluating the quality of SVG images
+against text prompts using CLIP embeddings with memory and performance 
+optimizations.
 """
 
 import os
-import io
-import gc
+import sys
 import time
-import logging
 import tempfile
 import threading
-import multiprocessing
-import platform
 import numpy as np
-from typing import Dict, Any, Optional, List, Union, Tuple, Callable
-from pathlib import Path
-from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Tuple, Optional, Union, Any, Callable
+from io import BytesIO
+from PIL import Image
+import logging
+import warnings
+import queue
+import cairosvg
+import hashlib
+import base64
 
-logger = logging.getLogger(__name__)
+# Import core optimizations
+from core import CONFIG, memoize, Profiler, get_thread_pool
+from utils.logger import get_logger
 
-# Global variables for device detection and caching
-DEVICE_INFO = {
-    "platform": platform.system(),
-    "processor": platform.processor(),
-    "is_apple_silicon": False,
-    "has_cuda": False,
-    "has_mps": False,
-    "has_rocm": False,
-    "cpu_cores": multiprocessing.cpu_count()
-}
+# Configure logger
+logger = get_logger(__name__)
 
-# Detection for Apple Silicon
-if DEVICE_INFO["platform"] == "Darwin" and "arm" in platform.processor().lower():
-    DEVICE_INFO["is_apple_silicon"] = True
+# Type aliases
+ClipScore = float
+ImageEmbedding = np.ndarray
+TextEmbedding = np.ndarray
+Batch = List[Any]
 
-# Implement lazy imports for optional dependencies
-class LazyImporter:
-    """Handles lazy importing of optional dependencies."""
-    
-    _instance = None
-    _lock = threading.Lock()
-    
-    def __new__(cls):
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = super(LazyImporter, cls).__new__(cls)
-                cls._instance.imported = {}
-            return cls._instance
-    
-    def import_torch(self):
-        """Import PyTorch modules on demand."""
-        if "torch" not in self.imported:
-            try:
-                import torch
-                import torch.nn.functional as F
-                self.imported["torch"] = torch
-                self.imported["F"] = F
-                
-                # Check for CUDA
-                if torch.cuda.is_available():
-                    DEVICE_INFO["has_cuda"] = True
-                
-                # Check for MPS (Apple Silicon)
-                if hasattr(torch, 'mps') and torch.mps.is_available():
-                    DEVICE_INFO["has_mps"] = True
-                
-                # Check for ROCm (AMD)
-                if hasattr(torch, 'xpu') and torch.xpu.is_available():
-                    DEVICE_INFO["has_rocm"] = True
-                
-                logger.debug(f"PyTorch {torch.__version__} loaded successfully")
-                return True
-            except ImportError:
-                logger.warning("PyTorch not installed. CLIP evaluation will be unavailable.")
-                self.imported["torch"] = None
-                return False
-        return self.imported["torch"] is not None
-    
-    def import_transformers(self):
-        """Import transformers modules on demand."""
-        if "transformers" not in self.imported:
-            try:
-                from transformers import AutoProcessor, AutoModel, CLIPProcessor, CLIPModel
-                self.imported["AutoProcessor"] = AutoProcessor
-                self.imported["AutoModel"] = AutoModel
-                self.imported["CLIPProcessor"] = CLIPProcessor
-                self.imported["CLIPModel"] = CLIPModel
-                
-                logger.debug("Transformers library loaded successfully")
-                return True
-            except ImportError:
-                logger.warning("Transformers not installed. CLIP evaluation will be unavailable.")
-                self.imported["transformers"] = None
-                return False
-        return "AutoProcessor" in self.imported
-    
-    def import_cairosvg(self):
-        """Import CairoSVG for SVG rendering."""
-        if "cairosvg" not in self.imported:
-            try:
-                import cairosvg
-                self.imported["cairosvg"] = cairosvg
-                
-                logger.debug("CairoSVG library loaded successfully")
-                return True
-            except ImportError:
-                logger.warning("CairoSVG not installed. SVG rendering will be limited.")
-                self.imported["cairosvg"] = None
-                return False
-        return self.imported["cairosvg"] is not None
-    
-    def import_pil(self):
-        """Import PIL for image processing."""
-        if "PIL" not in self.imported:
-            try:
-                from PIL import Image
-                self.imported["Image"] = Image
-                
-                logger.debug("PIL library loaded successfully")
-                return True
-            except ImportError:
-                logger.warning("PIL not installed. Image processing will be unavailable.")
-                self.imported["PIL"] = None
-                return False
-        return "Image" in self.imported
-    
-    def get_module(self, name):
-        """Get an imported module by name."""
-        return self.imported.get(name)
+# Constants
+DEFAULT_IMAGE_SIZE = 224  # Default CLIP input size
+DEFAULT_BATCH_SIZE = 32
+CACHE_SIZE = 2048  # Number of embeddings to cache
+WORKER_TIMEOUT = 0.1  # Seconds to wait for worker threads
+DEFAULT_TOP_K = 5
 
 
-class CLIPEvaluator:
-    """
-    Optimized class for evaluating SVG-text similarity using CLIP-based models.
-    Supports hardware acceleration across various platforms.
-    """
+class ClipCache:
+    """Thread-safe cache for CLIP embeddings."""
     
-    _instance = None
-    _lock = threading.Lock()
-    
-    def __new__(cls, *args, **kwargs):
-        """Implement singleton pattern for resource efficiency."""
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = super(CLIPEvaluator, cls).__new__(cls)
-            return cls._instance
-    
-    def __init__(self, 
-                 model_name: str = "SigLIP-SoViT-400m",
-                 device: str = "auto",
-                 cache_dir: str = ".cache/clip",
-                 use_normalized_score: bool = True,
-                 batch_size: int = 8,
-                 num_workers: int = 4,
-                 image_size: int = 224,
-                 precision: str = "fp16"):
+    def __init__(self, max_size: int = CACHE_SIZE):
         """
-        Initialize the CLIP evaluator with model configurations.
+        Initialize cache.
         
         Args:
-            model_name: Name of the CLIP model to use
-            device: Device to run models on ('cpu', 'cuda', 'mps', 'auto')
-            cache_dir: Directory for model caching
-            use_normalized_score: Whether to normalize similarity scores
-            batch_size: Batch size for processing multiple images
-            num_workers: Number of workers for data loading
-            image_size: Size to resize images to
-            precision: Computation precision ('fp32', 'fp16', 'bf16')
+            max_size: Maximum number of cached items
         """
-        # Initialize only once (singleton pattern)
-        if hasattr(self, 'initialized'):
-            return
+        self.max_size = max_size
+        self._text_cache: Dict[str, TextEmbedding] = {}
+        self._image_cache: Dict[str, ImageEmbedding] = {}
+        self._svg_cache: Dict[str, ImageEmbedding] = {}
+        self._access_count: Dict[str, int] = {}
+        self._lock = threading.RLock()
+    
+    def get_text_embedding(self, text: str) -> Optional[TextEmbedding]:
+        """
+        Get cached text embedding.
         
-        self.lazy_importer = LazyImporter()
+        Args:
+            text: Text to get embedding for
+            
+        Returns:
+            Cached embedding or None if not cached
+        """
+        with self._lock:
+            text_key = self._get_text_key(text)
+            if text_key in self._text_cache:
+                self._access_count[text_key] = self._access_count.get(text_key, 0) + 1
+                return self._text_cache[text_key]
+            return None
+    
+    def set_text_embedding(self, text: str, embedding: TextEmbedding) -> None:
+        """
+        Cache text embedding.
+        
+        Args:
+            text: Text to cache embedding for
+            embedding: Embedding to cache
+        """
+        with self._lock:
+            text_key = self._get_text_key(text)
+            self._text_cache[text_key] = embedding
+            self._access_count[text_key] = 1
+            self._prune_cache_if_needed()
+    
+    def get_image_embedding(self, image: Union[Image.Image, np.ndarray]) -> Optional[ImageEmbedding]:
+        """
+        Get cached image embedding.
+        
+        Args:
+            image: Image to get embedding for
+            
+        Returns:
+            Cached embedding or None if not cached
+        """
+        with self._lock:
+            image_key = self._get_image_key(image)
+            if image_key in self._image_cache:
+                self._access_count[image_key] = self._access_count.get(image_key, 0) + 1
+                return self._image_cache[image_key]
+            return None
+    
+    def set_image_embedding(self, image: Union[Image.Image, np.ndarray], embedding: ImageEmbedding) -> None:
+        """
+        Cache image embedding.
+        
+        Args:
+            image: Image to cache embedding for
+            embedding: Embedding to cache
+        """
+        with self._lock:
+            image_key = self._get_image_key(image)
+            self._image_cache[image_key] = embedding
+            self._access_count[image_key] = 1
+            self._prune_cache_if_needed()
+    
+    def get_svg_embedding(self, svg_content: str) -> Optional[ImageEmbedding]:
+        """
+        Get cached SVG embedding.
+        
+        Args:
+            svg_content: SVG content to get embedding for
+            
+        Returns:
+            Cached embedding or None if not cached
+        """
+        with self._lock:
+            svg_key = self._get_svg_key(svg_content)
+            if svg_key in self._svg_cache:
+                self._access_count[svg_key] = self._access_count.get(svg_key, 0) + 1
+                return self._svg_cache[svg_key]
+            return None
+    
+    def set_svg_embedding(self, svg_content: str, embedding: ImageEmbedding) -> None:
+        """
+        Cache SVG embedding.
+        
+        Args:
+            svg_content: SVG content to cache embedding for
+            embedding: Embedding to cache
+        """
+        with self._lock:
+            svg_key = self._get_svg_key(svg_content)
+            self._svg_cache[svg_key] = embedding
+            self._access_count[svg_key] = 1
+            self._prune_cache_if_needed()
+    
+    def clear(self) -> None:
+        """Clear all caches."""
+        with self._lock:
+            self._text_cache.clear()
+            self._image_cache.clear()
+            self._svg_cache.clear()
+            self._access_count.clear()
+    
+    def _get_text_key(self, text: str) -> str:
+        """
+        Generate cache key for text.
+        
+        Args:
+            text: Text to generate key for
+            
+        Returns:
+            Cache key
+        """
+        # Use MD5 for fast hashing
+        return f"text_{hashlib.md5(text.encode('utf-8')).hexdigest()}"
+    
+    def _get_image_key(self, image: Union[Image.Image, np.ndarray]) -> str:
+        """
+        Generate cache key for image.
+        
+        Args:
+            image: Image to generate key for
+            
+        Returns:
+            Cache key
+        """
+        # Convert image to bytes for hashing
+        if isinstance(image, Image.Image):
+            image_bytes = BytesIO()
+            image.save(image_bytes, format='PNG')
+            image_data = image_bytes.getvalue()
+        else:
+            # Numpy array
+            image_data = image.tobytes()
+            
+        return f"image_{hashlib.md5(image_data).hexdigest()}"
+    
+    def _get_svg_key(self, svg_content: str) -> str:
+        """
+        Generate cache key for SVG content.
+        
+        Args:
+            svg_content: SVG content to generate key for
+            
+        Returns:
+            Cache key
+        """
+        return f"svg_{hashlib.md5(svg_content.encode('utf-8')).hexdigest()}"
+    
+    def _prune_cache_if_needed(self) -> None:
+        """Prune cache if it exceeds maximum size."""
+        # Check total cache size
+        total_size = len(self._text_cache) + len(self._image_cache) + len(self._svg_cache)
+        
+        if total_size > self.max_size:
+            # Get all keys with access counts
+            all_keys = list(self._access_count.keys())
+            all_counts = [self._access_count[k] for k in all_keys]
+            
+            # Sort keys by access count (ascending)
+            sorted_keys = [k for _, k in sorted(zip(all_counts, all_keys))]
+            
+            # Calculate how many to remove
+            to_remove = total_size - self.max_size + (self.max_size // 10)  # Remove extra 10% to avoid frequent pruning
+            
+            # Remove least accessed items
+            for key in sorted_keys[:to_remove]:
+                if key in self._text_cache:
+                    del self._text_cache[key]
+                if key in self._image_cache:
+                    del self._image_cache[key]
+                if key in self._svg_cache:
+                    del self._svg_cache[key]
+                del self._access_count[key]
+
+
+class ClipEvaluator:
+    """
+    Production-grade CLIP-based evaluator for image-text matching.
+    
+    Uses CLIP embeddings to evaluate how well images match text prompts.
+    Includes optimizations for memory usage, batch processing, and caching.
+    """
+    
+    def __init__(
+        self,
+        model_name: str = "openai/clip-vit-base-patch32",
+        device: Optional[str] = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        cache_size: int = CACHE_SIZE,
+        use_jit: bool = None,
+        use_fp16: bool = None,
+        thread_workers: int = None
+    ):
+        """
+        Initialize CLIP evaluator.
+        
+        Args:
+            model_name: CLIP model name
+            device: Device to run on (None for auto-detection)
+            batch_size: Batch size for processing
+            cache_size: Size of embedding cache
+            use_jit: Whether to use JIT compilation
+            use_fp16: Whether to use FP16 precision
+            thread_workers: Number of worker threads
+        """
         self.model_name = model_name
-        self.cache_dir = cache_dir
-        self.use_normalized_score = use_normalized_score
+        
+        # Auto-detect device if not provided
+        self.device = device
+        if self.device is None:
+            import torch
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            
+        # Set up parameters
         self.batch_size = batch_size
-        self.num_workers = min(num_workers, os.cpu_count() or 4)
-        self.image_size = image_size
-        self.precision = precision
         
-        # Create cache directory if it doesn't exist
-        os.makedirs(cache_dir, exist_ok=True)
+        # Use values from config if not provided
+        self.use_jit = use_jit if use_jit is not None else CONFIG.get("enable_jit", True)
+        self.use_fp16 = use_fp16 if use_fp16 is not None else (self.device == "cuda")
         
-        # Determine optimal device
-        self.device = self._determine_optimal_device(device)
+        # Set up thread workers
+        self.thread_workers = thread_workers or CONFIG.get(
+            "thread_pool_size",
+            min(32, os.cpu_count() or 4)
+        )
         
-        # SVG rendering cache
-        self._svg_cache = {}
-        self._cache_max_size = 100
+        # Initialize cache
+        self.cache = ClipCache(max_size=cache_size)
         
-        # Track model loading status
-        self.model_loaded = False
-        self.model = None
-        self.processor = None
+        # Initialize model
+        self._model = None
+        self._processor = None
+        self._tokenizer = None
         
-        # Prepare embedding cache
-        self._text_embedding_cache = {}
-        self._image_embedding_cache = {}
+        # Threading resources
+        self._worker_queue = queue.Queue()
+        self._result_queue = queue.Queue()
+        self._stop_event = threading.Event()
+        self._workers = []
         
-        # Flag for initialization
-        self.initialized = True
-        logger.info(f"CLIP Evaluator initialized with device: {self.device}")
-        
-    def _determine_optimal_device(self, requested_device: str) -> str:
-        """
-        Determine the optimal device based on available hardware and request.
-        
-        Args:
-            requested_device: Requested device ('cpu', 'cuda', 'mps', 'auto')
-            
-        Returns:
-            Optimal device to use
-        """
-        if requested_device != "auto":
-            return requested_device
-        
-        # Import torch to check device availability    
-        if self.lazy_importer.import_torch():
-            torch = self.lazy_importer.get_module("torch")
-            
-            # Check CUDA (NVIDIA)
-            if DEVICE_INFO["has_cuda"]:
-                return "cuda"
-                
-            # Check MPS (Apple Silicon)
-            elif DEVICE_INFO["has_mps"]:
-                return "mps"
-                
-            # Check ROCm (AMD)
-            elif DEVICE_INFO["has_rocm"]:
-                return "xpu"
-        
-        # Fall back to CPU
-        return "cpu"
-        
-    def load_model(self) -> bool:
-        """
-        Load the CLIP model for similarity evaluation with appropriate optimizations.
-        
-        Returns:
-            Whether the model was successfully loaded
-        """
-        if self.model_loaded:
-            return True
-            
-        try:
-            # Try loading the requested model
-            if self.model_name == "SigLIP-SoViT-400m":
-                return self._load_siglip_model()
-            else:
-                return self._load_generic_clip_model()
-                
-        except Exception as e:
-            logger.error(f"Failed to load CLIP model: {str(e)}")
-            return False
-            
-    def _load_siglip_model(self) -> bool:
-        """Load the SigLIP model with optimizations for current hardware."""
-        try:
-            # Ensure required dependencies are available
-            if not self.lazy_importer.import_torch() or not self.lazy_importer.import_transformers():
-                logger.error("Required dependencies not available for SigLIP model")
-                return False
-                
-            torch = self.lazy_importer.get_module("torch")
-            AutoProcessor = self.lazy_importer.get_module("AutoProcessor")
-            AutoModel = self.lazy_importer.get_module("AutoModel")
-            
-            start_time = time.time()
-            
-            # Determine optimal precision based on device and settings
-            dtype = None
-            if self.precision == "fp16" and self.device in ["cuda", "xpu"]:
-                dtype = torch.float16
-            elif self.precision == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-                dtype = torch.bfloat16
-            
-            # Load processor
-            logger.info("Loading SigLIP processor...")
-            self.processor = AutoProcessor.from_pretrained(
-                "google/siglip-base-patch16-224", 
-                cache_dir=self.cache_dir
-            )
-            
-            # Load model with optimizations
-            logger.info("Loading SigLIP model...")
-            self.model = AutoModel.from_pretrained(
-                "google/siglip-base-patch16-224", 
-                cache_dir=self.cache_dir,
-                torch_dtype=dtype
-            )
-            
-            # Move model to device and apply optimizations
-            if self.device != "cpu":
-                self.model = self.model.to(self.device)
-                
-            # Apply device-specific optimizations
-            self._apply_model_optimizations()
-            
-            # Set model to evaluation mode
-            self.model.eval()
-            
-            self.model_loaded = True
-            load_time = time.time() - start_time
-            logger.info(f"Successfully loaded SigLIP model in {load_time:.2f} seconds")
-            
-            return True
-            
-        except ImportError:
-            logger.error("Failed to import required libraries for SigLIP model")
-            return False
-        except Exception as e:
-            logger.error(f"Error loading SigLIP model: {str(e)}")
-            return False
-            
-    def _load_generic_clip_model(self) -> bool:
-        """Load a generic CLIP model with optimizations."""
-        try:
-            # Ensure required dependencies are available
-            if not self.lazy_importer.import_torch() or not self.lazy_importer.import_transformers():
-                logger.error("Required dependencies not available for CLIP model")
-                return False
-                
-            torch = self.lazy_importer.get_module("torch")
-            CLIPProcessor = self.lazy_importer.get_module("CLIPProcessor")
-            CLIPModel = self.lazy_importer.get_module("CLIPModel")
-            
-            start_time = time.time()
-            
-            # Determine model name to load
-            model_name = "openai/clip-vit-base-patch32"
-            
-            # Determine optimal precision based on device and settings
-            dtype = None
-            if self.precision == "fp16" and self.device in ["cuda", "xpu"]:
-                dtype = torch.float16
-            elif self.precision == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-                dtype = torch.bfloat16
-            
-            # Load processor and model
-            logger.info(f"Loading CLIP processor for {model_name}...")
-            self.processor = CLIPProcessor.from_pretrained(model_name, cache_dir=self.cache_dir)
-            
-            logger.info(f"Loading CLIP model {model_name}...")
-            self.model = CLIPModel.from_pretrained(
-                model_name, 
-                cache_dir=self.cache_dir,
-                torch_dtype=dtype
-            )
-            
-            # Move model to device and apply optimizations
-            if self.device != "cpu":
-                self.model = self.model.to(self.device)
-                
-            # Apply device-specific optimizations
-            self._apply_model_optimizations()
-            
-            # Set model to evaluation mode
-            self.model.eval()
-            
-            self.model_loaded = True
-            load_time = time.time() - start_time
-            logger.info(f"Successfully loaded CLIP model in {load_time:.2f} seconds")
-            
-            return True
-            
-        except ImportError:
-            logger.error("Failed to import required libraries for CLIP model")
-            return False
-        except Exception as e:
-            logger.error(f"Error loading CLIP model: {str(e)}")
-            return False
+        # Lazy initialization flag
+        self._initialized = False
     
-    def _apply_model_optimizations(self) -> None:
-        """Apply device-specific optimizations to the model."""
-        if not self.lazy_importer.import_torch():
+    def _ensure_initialized(self) -> None:
+        """
+        Ensure model is initialized.
+        
+        Lazy initialization to avoid loading the model until needed.
+        """
+        if self._initialized:
             return
             
-        torch = self.lazy_importer.get_module("torch")
-        
-        # Check if model should be on a specific device
-        if self.device == "cuda" and torch.cuda.is_available():
-            # Enable CUDA optimizations
-            if hasattr(torch.backends, 'cudnn'):
-                torch.backends.cudnn.benchmark = True
+        with Profiler("clip_init"):
+            logger.info(f"Initializing CLIP model: {self.model_name} on {self.device}")
+            
+            try:
+                # Import here for lazy loading
+                import torch
+                import transformers
+                from transformers import CLIPProcessor, CLIPModel, CLIPTokenizer
                 
-            # Enable TF32 precision on Ampere or newer GPUs
-            if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
-                torch.backends.cuda.matmul.allow_tf32 = True
+                # Load model and processor
+                self._model = CLIPModel.from_pretrained(self.model_name)
+                self._processor = CLIPProcessor.from_pretrained(self.model_name)
+                self._tokenizer = CLIPTokenizer.from_pretrained(self.model_name)
                 
-        elif self.device == "mps" and hasattr(torch, 'mps') and torch.mps.is_available():
-            # MPS-specific optimizations for Apple Silicon
-            pass  # No specific optimizations needed currently
-            
-        # Optimize for CPU if using it
-        if self.device == "cpu":
-            # Enable OpenMP parallel processing if available
-            if hasattr(torch, 'set_num_threads'):
-                # Use all available cores but one for system operations
-                torch.set_num_threads(max(1, DEVICE_INFO["cpu_cores"] - 1))
+                # Move model to device
+                self._model.to(self.device)
                 
-            # Enable MKL optimizations if available
-            if hasattr(torch, 'set_num_interop_threads'):
-                torch.set_num_interop_threads(max(1, DEVICE_INFO["cpu_cores"] // 2))
-        
-        # Use torch script to optimize model if possible
-        try:
-            if hasattr(self.model, 'torchscript'):
-                logger.info("Applying TorchScript optimization")
-                self.model = torch.jit.script(self.model)
-        except Exception as e:
-            logger.debug(f"TorchScript optimization skipped: {str(e)}")
-    
-    @lru_cache(maxsize=128)
-    def _get_cache_key(self, svg_code: str) -> str:
-        """
-        Generate a deterministic cache key for SVG content.
-        
-        Args:
-            svg_code: SVG code to generate key for
-            
-        Returns:
-            Cache key string
-        """
-        import hashlib
-        # Create a deterministic hash of the SVG code
-        return hashlib.md5(svg_code.encode()).hexdigest()
-            
-    def compute_similarity(self, svg_code: str, text_prompt: str) -> float:
-        """
-        Compute similarity between SVG and text using CLIP.
-        
-        Args:
-            svg_code: SVG code to evaluate
-            text_prompt: Text prompt to compare against
-            
-        Returns:
-            Similarity score (0.0 to 1.0)
-        """
-        # Check if model is loaded
-        if not self.model_loaded and not self.load_model():
-            logger.error("CLIP model not loaded, cannot compute similarity")
-            return 0.0
-            
-        try:
-            # Convert SVG to image
-            image = self._svg_to_image(svg_code)
-            if image is None:
-                logger.error("Failed to convert SVG to image for CLIP evaluation")
-                return 0.0
-                
-            # Prepare text with prefix for CLIP matching
-            if not text_prompt.startswith("SVG illustration of "):
-                text_prompt = f"SVG illustration of {text_prompt}"
-                
-            # Get embeddings
-            text_embedding = self._get_text_embedding(text_prompt)
-            image_embedding = self._get_image_embedding(image)
-            
-            if text_embedding is None or image_embedding is None:
-                logger.error("Failed to generate embeddings")
-                return 0.0
-                
-            # Compute similarity
-            similarity = self._compute_embedding_similarity(text_embedding, image_embedding)
-            
-            logger.info(f"CLIP similarity score: {similarity:.4f}")
-            return similarity
-            
-        except Exception as e:
-            logger.error(f"Error computing CLIP similarity: {str(e)}")
-            return 0.0
-    
-    def _get_text_embedding(self, text: str) -> Optional[np.ndarray]:
-        """
-        Get text embedding with caching.
-        
-        Args:
-            text: Text to embed
-            
-        Returns:
-            Text embedding array
-        """
-        # Check cache
-        if text in self._text_embedding_cache:
-            return self._text_embedding_cache[text]
-            
-        try:
-            torch = self.lazy_importer.get_module("torch")
-            
-            # Process input
-            inputs = self.processor(
-                text=[text],
-                return_tensors="pt",
-                padding=True
-            )
-            
-            # Move inputs to device
-            if self.device != "cpu":
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                
-            # Generate embedding
-            with torch.no_grad():
-                if self.model_name == "SigLIP-SoViT-400m":
-                    # For SigLIP model
-                    outputs = self.model.get_text_features(**inputs)
-                    text_embedding = outputs.cpu().numpy()
-                else:
-                    # For standard CLIP model
-                    outputs = self.model.get_text_features(**inputs)
-                    text_embedding = outputs.cpu().numpy()
+                # Apply JIT if enabled
+                if self.use_jit and hasattr(torch, "jit"):
+                    logger.info("Using JIT compilation for CLIP model")
+                    self._model = torch.jit.script(self._model)
                     
-            # Cache the embedding
-            self._text_embedding_cache[text] = text_embedding
-            
-            # Limit cache size
-            if len(self._text_embedding_cache) > 100:
-                # Remove oldest key (arbitrary but consistent)
-                oldest_key = next(iter(self._text_embedding_cache))
-                del self._text_embedding_cache[oldest_key]
-                
-            return text_embedding
-            
-        except Exception as e:
-            logger.error(f"Error generating text embedding: {str(e)}")
-            return None
-            
-    def _get_image_embedding(self, image) -> Optional[np.ndarray]:
-        """
-        Get image embedding with caching.
-        
-        Args:
-            image: PIL Image to embed
-            
-        Returns:
-            Image embedding array
-        """
-        # Create a cache key from image data
-        image_data = self._get_image_data(image)
-        cache_key = hash(image_data)
-        
-        # Check cache
-        if cache_key in self._image_embedding_cache:
-            return self._image_embedding_cache[cache_key]
-            
-        try:
-            torch = self.lazy_importer.get_module("torch")
-            
-            # Process input
-            inputs = self.processor(
-                images=[image],
-                return_tensors="pt",
-                padding=True
-            )
-            
-            # Move inputs to device
-            if self.device != "cpu":
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                
-            # Generate embedding
-            with torch.no_grad():
-                if self.model_name == "SigLIP-SoViT-400m":
-                    # For SigLIP model
-                    outputs = self.model.get_image_features(**inputs)
-                    image_embedding = outputs.cpu().numpy()
-                else:
-                    # For standard CLIP model
-                    outputs = self.model.get_image_features(**inputs)
-                    image_embedding = outputs.cpu().numpy()
+                # Use FP16 if enabled
+                if self.use_fp16 and self.device == "cuda":
+                    logger.info("Using FP16 precision for CLIP model")
+                    self._model.half()
                     
-            # Cache the embedding
-            self._image_embedding_cache[cache_key] = image_embedding
-            
-            # Limit cache size
-            if len(self._image_embedding_cache) > 100:
-                # Remove oldest key (arbitrary but consistent)
-                oldest_key = next(iter(self._image_embedding_cache))
-                del self._image_embedding_cache[oldest_key]
+                # Set to evaluation mode
+                self._model.eval()
                 
-            return image_embedding
-            
-        except Exception as e:
-            logger.error(f"Error generating image embedding: {str(e)}")
-            return None
+                # Start worker threads
+                self._start_workers()
+                
+                self._initialized = True
+                logger.info("CLIP model initialized successfully")
+                
+            except Exception as e:
+                logger.error(f"Error initializing CLIP model: {str(e)}")
+                raise
     
-    def _get_image_data(self, image) -> bytes:
-        """Convert image to serializable bytes for caching."""
-        with io.BytesIO() as buffer:
-            image.save(buffer, format="PNG")
-            return buffer.getvalue()
+    def _start_workers(self) -> None:
+        """Start worker threads for batch processing."""
+        for i in range(self.thread_workers):
+            worker = threading.Thread(
+                target=self._worker_loop,
+                daemon=True,
+                name=f"clip_worker_{i}"
+            )
+            worker.start()
+            self._workers.append(worker)
             
-    def _compute_embedding_similarity(self, text_embedding: np.ndarray, image_embedding: np.ndarray) -> float:
+        logger.debug(f"Started {self.thread_workers} CLIP worker threads")
+    
+    def _worker_loop(self) -> None:
+        """Worker thread loop."""
+        while not self._stop_event.is_set():
+            try:
+                # Get task with timeout
+                task = self._worker_queue.get(timeout=WORKER_TIMEOUT)
+                task_type, data, task_id = task
+                
+                # Process task
+                if task_type == "text":
+                    result = self._encode_text_batch(data)
+                elif task_type == "image":
+                    result = self._encode_image_batch(data)
+                else:
+                    logger.warning(f"Unknown task type: {task_type}")
+                    result = None
+                    
+                # Put result in queue
+                self._result_queue.put((task_id, result))
+                
+                # Mark task as done
+                self._worker_queue.task_done()
+                
+            except queue.Empty:
+                # No tasks available
+                continue
+            except Exception as e:
+                logger.error(f"Error in CLIP worker thread: {str(e)}")
+                
+                # Put error in result queue
+                self._result_queue.put((task_id, e))
+                
+                # Mark task as done
+                self._worker_queue.task_done()
+    
+    def _encode_text_batch(self, texts: List[str]) -> np.ndarray:
         """
-        Compute cosine similarity between embeddings.
+        Encode a batch of texts.
         
         Args:
-            text_embedding: Text embedding array
-            image_embedding: Image embedding array
+            texts: List of texts to encode
             
         Returns:
-            Similarity score (0.0 to 1.0)
+            Batch of text embeddings
         """
-        # Normalize embeddings
-        text_embedding = text_embedding / np.linalg.norm(text_embedding, axis=1, keepdims=True)
-        image_embedding = image_embedding / np.linalg.norm(image_embedding, axis=1, keepdims=True)
+        import torch
         
-        # Compute cosine similarity
-        similarity = np.sum(text_embedding * image_embedding)
+        with torch.no_grad():
+            # Tokenize texts
+            inputs = self._tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                return_tensors="pt"
+            ).to(self.device)
+            
+            # Get text embeddings
+            text_features = self._model.get_text_features(**inputs)
+            
+            # Normalize embeddings
+            text_embeddings = text_features / text_features.norm(dim=1, keepdim=True)
+            
+            # Convert to numpy
+            return text_embeddings.cpu().numpy()
+    
+    def _encode_image_batch(self, images: List[Image.Image]) -> np.ndarray:
+        """
+        Encode a batch of images.
         
-        # Normalize score if requested
-        if self.use_normalized_score:
-            # Convert cosine similarity to a 0-1 range (it's originally -1 to 1)
+        Args:
+            images: List of images to encode
+            
+        Returns:
+            Batch of image embeddings
+        """
+        import torch
+        
+        with torch.no_grad():
+            # Process images
+            inputs = self._processor(
+                images=images,
+                return_tensors="pt"
+            ).to(self.device)
+            
+            # Get image embeddings
+            image_features = self._model.get_image_features(**inputs)
+            
+            # Normalize embeddings
+            image_embeddings = image_features / image_features.norm(dim=1, keepdim=True)
+            
+            # Convert to numpy
+            return image_embeddings.cpu().numpy()
+    
+    def encode_texts(self, texts: List[str]) -> np.ndarray:
+        """
+        Encode texts into embeddings.
+        
+        Args:
+            texts: List of texts to encode
+            
+        Returns:
+            Array of text embeddings
+        """
+        self._ensure_initialized()
+        
+        with Profiler("encode_texts"):
+            # Check cache for each text
+            cached_embeddings = []
+            texts_to_encode = []
+            text_indices = []
+            
+            for i, text in enumerate(texts):
+                cached = self.cache.get_text_embedding(text)
+                if cached is not None:
+                    cached_embeddings.append((i, cached))
+                else:
+                    texts_to_encode.append(text)
+                    text_indices.append(i)
+                    
+            # Create result array
+            result = np.zeros((len(texts), self._get_embedding_dim()), dtype=np.float32)
+            
+            # Add cached embeddings
+            for i, embedding in cached_embeddings:
+                result[i] = embedding
+                
+            # Process texts in batches if needed
+            if texts_to_encode:
+                text_batches = self._create_batches(texts_to_encode, self.batch_size)
+                
+                # Process batches in parallel
+                batch_results = self._process_batches("text", text_batches)
+                
+                # Combine batches
+                all_embeddings = np.vstack(batch_results)
+                
+                # Add to result
+                for i, embedding_idx in enumerate(text_indices):
+                    result[embedding_idx] = all_embeddings[i]
+                    
+                    # Cache embedding
+                    self.cache.set_text_embedding(texts_to_encode[i], all_embeddings[i])
+                    
+            return result
+    
+    def encode_images(self, images: List[Image.Image]) -> np.ndarray:
+        """
+        Encode images into embeddings.
+        
+        Args:
+            images: List of images to encode
+            
+        Returns:
+            Array of image embeddings
+        """
+        self._ensure_initialized()
+        
+        with Profiler("encode_images"):
+            # Check cache for each image
+            cached_embeddings = []
+            images_to_encode = []
+            image_indices = []
+            
+            for i, image in enumerate(images):
+                cached = self.cache.get_image_embedding(image)
+                if cached is not None:
+                    cached_embeddings.append((i, cached))
+                else:
+                    images_to_encode.append(image)
+                    image_indices.append(i)
+                    
+            # Create result array
+            result = np.zeros((len(images), self._get_embedding_dim()), dtype=np.float32)
+            
+            # Add cached embeddings
+            for i, embedding in cached_embeddings:
+                result[i] = embedding
+                
+            # Process images in batches if needed
+            if images_to_encode:
+                image_batches = self._create_batches(images_to_encode, self.batch_size)
+                
+                # Process batches in parallel
+                batch_results = self._process_batches("image", image_batches)
+                
+                # Combine batches
+                all_embeddings = np.vstack(batch_results)
+                
+                # Add to result
+                for i, embedding_idx in enumerate(image_indices):
+                    result[embedding_idx] = all_embeddings[i]
+                    
+                    # Cache embedding
+                    self.cache.set_image_embedding(images_to_encode[i], all_embeddings[i])
+                    
+            return result
+    
+    def encode_svg(self, svg_content: str, size: int = DEFAULT_IMAGE_SIZE) -> np.ndarray:
+        """
+        Encode SVG content into an embedding.
+        
+        Args:
+            svg_content: SVG content to encode
+            size: Size of rasterized image
+            
+        Returns:
+            Embedding for the SVG
+        """
+        self._ensure_initialized()
+        
+        with Profiler("encode_svg"):
+            # Check cache
+            cached = self.cache.get_svg_embedding(svg_content)
+            if cached is not None:
+                return cached
+                
+            # Convert SVG to PNG
+            png_data = self._svg_to_png(svg_content, size)
+            
+            # Convert PNG to image
+            image = Image.open(BytesIO(png_data))
+            
+            # Encode image
+            embedding = self.encode_images([image])[0]
+            
+            # Cache embedding
+            self.cache.set_svg_embedding(svg_content, embedding)
+            
+            return embedding
+    
+    def encode_svgs(self, svg_contents: List[str], size: int = DEFAULT_IMAGE_SIZE) -> np.ndarray:
+        """
+        Encode multiple SVG contents into embeddings.
+        
+        Args:
+            svg_contents: List of SVG contents to encode
+            size: Size of rasterized images
+            
+        Returns:
+            Array of SVG embeddings
+        """
+        self._ensure_initialized()
+        
+        with Profiler("encode_svgs"):
+            # Check cache for each SVG
+            cached_embeddings = []
+            svgs_to_encode = []
+            svg_indices = []
+            
+            for i, svg in enumerate(svg_contents):
+                cached = self.cache.get_svg_embedding(svg)
+                if cached is not None:
+                    cached_embeddings.append((i, cached))
+                else:
+                    svgs_to_encode.append(svg)
+                    svg_indices.append(i)
+                    
+            # Create result array
+            result = np.zeros((len(svg_contents), self._get_embedding_dim()), dtype=np.float32)
+            
+            # Add cached embeddings
+            for i, embedding in cached_embeddings:
+                result[i] = embedding
+                
+            # Convert SVGs to images
+            images = []
+            for svg in svgs_to_encode:
+                try:
+                    # Convert SVG to PNG
+                    png_data = self._svg_to_png(svg, size)
+                    
+                    # Convert PNG to image
+                    image = Image.open(BytesIO(png_data))
+                    images.append(image)
+                except Exception as e:
+                    logger.error(f"Error converting SVG to image: {str(e)}")
+                    
+                    # Use empty image as fallback
+                    images.append(Image.new('RGB', (size, size), color='white'))
+                    
+            # Encode images
+            if images:
+                image_embeddings = self.encode_images(images)
+                
+                # Add to result
+                for i, embedding_idx in enumerate(svg_indices):
+                    result[embedding_idx] = image_embeddings[i]
+                    
+                    # Cache embedding
+                    self.cache.set_svg_embedding(svgs_to_encode[i], image_embeddings[i])
+                    
+            return result
+    
+    def compute_similarity(
+        self,
+        text_embeddings: np.ndarray,
+        image_embeddings: np.ndarray
+    ) -> np.ndarray:
+        """
+        Compute similarity between text and image embeddings.
+        
+        Args:
+            text_embeddings: Text embeddings
+            image_embeddings: Image embeddings
+            
+        Returns:
+            Similarity matrix [text_count, image_count]
+        """
+        with Profiler("compute_similarity"):
+            # Ensure embeddings are normalized
+            text_norms = np.linalg.norm(text_embeddings, axis=1, keepdims=True)
+            image_norms = np.linalg.norm(image_embeddings, axis=1, keepdims=True)
+            
+            text_embeddings = text_embeddings / np.maximum(text_norms, 1e-10)
+            image_embeddings = image_embeddings / np.maximum(image_norms, 1e-10)
+            
+            # Compute dot product similarity
+            similarity = np.matmul(text_embeddings, image_embeddings.T)
+            
+            # Scale to 0-1 range
             similarity = (similarity + 1) / 2
             
-        return float(similarity)
-            
-    def _svg_to_image(self, svg_code: str) -> Optional[Any]:
+            return similarity
+    
+    def rank_images(
+        self,
+        query: str,
+        images: List[Image.Image],
+        top_k: int = DEFAULT_TOP_K
+    ) -> List[Tuple[int, ClipScore]]:
         """
-        Convert SVG code to a PIL Image for CLIP processing with caching.
+        Rank images by similarity to query.
         
         Args:
-            svg_code: SVG code to convert
+            query: Text query
+            images: List of images to rank
+            top_k: Number of top results to return
             
         Returns:
-            PIL Image or None if conversion fails
+            List of (image_index, similarity_score) tuples
         """
-        # Get cache key
-        cache_key = self._get_cache_key(svg_code)
+        self._ensure_initialized()
         
-        # Check cache
-        if cache_key in self._svg_cache:
-            return self._svg_cache[cache_key]
-        
-        try:
-            # Ensure CairoSVG and PIL are available
-            if not self.lazy_importer.import_cairosvg() or not self.lazy_importer.import_pil():
-                logger.error("Required dependencies for SVG conversion not available")
-                return None
-                
-            cairosvg = self.lazy_importer.get_module("cairosvg")
-            Image = self.lazy_importer.get_module("Image")
+        with Profiler("rank_images"):
+            # Encode query
+            text_embedding = self.encode_texts([query])
             
-            # Convert to PNG in memory
-            png_data = cairosvg.svg2png(bytestring=svg_code.encode('utf-8'))
+            # Encode images
+            image_embeddings = self.encode_images(images)
             
-            # Load as PIL Image
-            image = Image.open(io.BytesIO(png_data))
+            # Compute similarity
+            similarity = self.compute_similarity(text_embedding, image_embeddings)[0]
             
-            # Resize for CLIP model
-            image = image.resize((self.image_size, self.image_size))
+            # Get top-k indices
+            top_indices = np.argsort(-similarity)[:top_k]
             
-            # Cache the result
-            self._svg_cache[cache_key] = image
+            # Create result
+            result = [(int(idx), float(similarity[idx])) for idx in top_indices]
             
-            # Limit cache size
-            if len(self._svg_cache) > self._cache_max_size:
-                # Remove oldest key
-                oldest_key = next(iter(self._svg_cache))
-                del self._svg_cache[oldest_key]
-                
-            return image
-                
-        except Exception as e:
-            logger.error(f"Error converting SVG to image: {str(e)}")
-            
-            # Try fallback method with temp files if memory conversion failed
-            return self._svg_to_image_fallback(svg_code)
-            
-    def _svg_to_image_fallback(self, svg_code: str) -> Optional[Any]:
+            return result
+    
+    def rank_svgs(
+        self,
+        query: str,
+        svg_contents: List[str],
+        top_k: int = DEFAULT_TOP_K
+    ) -> List[Tuple[int, ClipScore]]:
         """
-        Fallback method for SVG to image conversion using temporary files.
+        Rank SVGs by similarity to query.
         
         Args:
-            svg_code: SVG code to convert
+            query: Text query
+            svg_contents: List of SVG contents to rank
+            top_k: Number of top results to return
             
         Returns:
-            PIL Image or None if conversion fails
+            List of (svg_index, similarity_score) tuples
         """
-        try:
-            # Ensure CairoSVG and PIL are available
-            if not self.lazy_importer.import_cairosvg() or not self.lazy_importer.import_pil():
-                logger.error("Required dependencies for SVG conversion not available")
-                return None
-                
-            cairosvg = self.lazy_importer.get_module("cairosvg")
-            Image = self.lazy_importer.get_module("Image")
+        self._ensure_initialized()
+        
+        with Profiler("rank_svgs"):
+            # Encode query
+            text_embedding = self.encode_texts([query])
             
-            # Create temp files
-            with tempfile.NamedTemporaryFile(suffix='.svg', delete=False) as svg_file:
-                svg_file.write(svg_code.encode('utf-8'))
-                svg_path = svg_file.name
-                
+            # Encode SVGs
+            svg_embeddings = self.encode_svgs(svg_contents)
+            
+            # Compute similarity
+            similarity = self.compute_similarity(text_embedding, svg_embeddings)[0]
+            
+            # Get top-k indices
+            top_indices = np.argsort(-similarity)[:top_k]
+            
+            # Create result
+            result = [(int(idx), float(similarity[idx])) for idx in top_indices]
+            
+            return result
+    
+    def evaluate_image(self, query: str, image: Image.Image) -> ClipScore:
+        """
+        Evaluate how well an image matches a query.
+        
+        Args:
+            query: Text query
+            image: Image to evaluate
+            
+        Returns:
+            Similarity score (0-1)
+        """
+        self._ensure_initialized()
+        
+        with Profiler("evaluate_image"):
+            # Encode query
+            text_embedding = self.encode_texts([query])
+            
+            # Encode image
+            image_embedding = self.encode_images([image])
+            
+            # Compute similarity
+            similarity = self.compute_similarity(text_embedding, image_embedding)[0, 0]
+            
+            return float(similarity)
+    
+    def evaluate_svg(self, query: str, svg_content: str) -> ClipScore:
+        """
+        Evaluate how well an SVG matches a query.
+        
+        Args:
+            query: Text query
+            svg_content: SVG content to evaluate
+            
+        Returns:
+            Similarity score (0-1)
+        """
+        self._ensure_initialized()
+        
+        with Profiler("evaluate_svg"):
+            # Encode query
+            text_embedding = self.encode_texts([query])
+            
+            # Encode SVG
+            svg_embedding = self.encode_svg(svg_content).reshape(1, -1)
+            
+            # Compute similarity
+            similarity = self.compute_similarity(text_embedding, svg_embedding)[0, 0]
+            
+            return float(similarity)
+    
+    def evaluate_batch(
+        self,
+        queries: List[str],
+        svg_contents: List[str]
+    ) -> np.ndarray:
+        """
+        Evaluate how well multiple SVGs match multiple queries.
+        
+        Args:
+            queries: List of text queries
+            svg_contents: List of SVG contents to evaluate
+            
+        Returns:
+            Similarity matrix [query_count, svg_count]
+        """
+        self._ensure_initialized()
+        
+        with Profiler("evaluate_batch"):
+            # Encode queries
+            text_embeddings = self.encode_texts(queries)
+            
+            # Encode SVGs
+            svg_embeddings = self.encode_svgs(svg_contents)
+            
+            # Compute similarity
+            similarity = self.compute_similarity(text_embeddings, svg_embeddings)
+            
+            return similarity
+    
+    def close(self) -> None:
+        """
+        Clean up resources.
+        
+        Should be called when the evaluator is no longer needed.
+        """
+        # Stop worker threads
+        self._stop_event.set()
+        
+        # Wait for workers to finish
+        for worker in self._workers:
+            worker.join(timeout=0.5)
+            
+        # Clear model and processor
+        self._model = None
+        self._processor = None
+        self._tokenizer = None
+        
+        # Clear cache
+        self.cache.clear()
+        
+        # Reset initialization flag
+        self._initialized = False
+        
+        logger.info("CLIP evaluator resources released")
+    
+    def _svg_to_png(self, svg_content: str, size: int) -> bytes:
+        """
+        Convert SVG content to PNG data.
+        
+        Args:
+            svg_content: SVG content to convert
+            size: Size of output image
+            
+        Returns:
+            PNG image data
+        """
+        with Profiler("svg_to_png"):
+            # Use cairosvg for conversion
             try:
-                # Create temp PNG file
-                png_path = f"{svg_path}.png"
+                png_data = cairosvg.svg2png(
+                    bytestring=svg_content.encode('utf-8'),
+                    output_width=size,
+                    output_height=size
+                )
+                return png_data
+            except Exception as e:
+                logger.error(f"Error converting SVG to PNG: {str(e)}")
                 
-                # Convert SVG to PNG
-                cairosvg.svg2png(url=svg_path, write_to=png_path)
+                # Create a fallback image (white background with error message)
+                img = Image.new('RGB', (size, size), color='white')
+                from PIL import ImageDraw
+                draw = ImageDraw.Draw(img)
+                draw.text((10, 10), "SVG Error", fill='red')
                 
-                # Load image
-                image = Image.open(png_path)
-                
-                # Resize for CLIP model
-                image = image.resize((self.image_size, self.image_size))
-                
-                return image
-                
-            finally:
-                # Clean up temp files
-                if os.path.exists(svg_path):
-                    os.unlink(svg_path)
-                if os.path.exists(f"{svg_path}.png"):
-                    os.unlink(f"{svg_path}.png")
-                    
-        except Exception as e:
-            logger.error(f"Error in SVG to image fallback: {str(e)}")
-            return None
-            
-    def evaluate_batch(self, 
-                       svg_prompt_pairs: List[Tuple[str, str]], 
-                       use_parallel: bool = True,
-                       callback: Optional[Callable[[int, float], None]] = None) -> List[float]:
+                # Convert to PNG data
+                img_bytes = BytesIO()
+                img.save(img_bytes, format='PNG')
+                return img_bytes.getvalue()
+    
+    def _get_embedding_dim(self) -> int:
         """
-        Compute similarity for a batch of SVG-prompt pairs with optimized processing.
+        Get dimension of embeddings.
+        
+        Returns:
+            Embedding dimension
+        """
+        if not self._initialized:
+            self._ensure_initialized()
+            
+        # Get embedding dimension from model
+        import torch
+        
+        with torch.no_grad():
+            # Create a dummy input
+            input_ids = torch.zeros((1, 1), dtype=torch.long).to(self.device)
+            attention_mask = torch.ones((1, 1), dtype=torch.long).to(self.device)
+            
+            # Get text features
+            text_features = self._model.get_text_features(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            
+            # Return dimension
+            return text_features.shape[1]
+    
+    @staticmethod
+    def _create_batches(items: List[Any], batch_size: int) -> List[List[Any]]:
+        """
+        Create batches from a list of items.
         
         Args:
-            svg_prompt_pairs: List of (svg_code, text_prompt) tuples
-            use_parallel: Whether to use parallel processing
-            callback: Optional callback function called with (index, score) after each evaluation
+            items: List of items to batch
+            batch_size: Size of each batch
             
         Returns:
-            List of similarity scores
+            List of batches
         """
-        # Process pairs in batches for better GPU utilization
-        if use_parallel and len(svg_prompt_pairs) > 1:
-            return self._evaluate_batch_parallel(svg_prompt_pairs, callback)
-        else:
-            return self._evaluate_batch_sequential(svg_prompt_pairs, callback)
+        return [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
     
-    def _evaluate_batch_sequential(self, 
-                                  svg_prompt_pairs: List[Tuple[str, str]], 
-                                  callback: Optional[Callable[[int, float], None]] = None) -> List[float]:
+    def _process_batches(self, task_type: str, batches: List[Batch]) -> List[np.ndarray]:
         """
-        Process SVG-prompt pairs sequentially.
+        Process batches in parallel.
         
         Args:
-            svg_prompt_pairs: List of (svg_code, text_prompt) tuples
-            callback: Optional callback function called with (index, score) after each evaluation
+            task_type: Type of task ("text" or "image")
+            batches: List of batches to process
             
         Returns:
-            List of similarity scores
+            List of results for each batch
         """
-        scores = []
+        # Task IDs for tracking results
+        task_ids = list(range(len(batches)))
         
-        for i, (svg_code, text_prompt) in enumerate(svg_prompt_pairs):
-            score = self.compute_similarity(svg_code, text_prompt)
-            scores.append(score)
+        # Submit tasks to queue
+        for i, batch in enumerate(batches):
+            self._worker_queue.put((task_type, batch, i))
             
-            # Call callback if provided
-            if callback:
-                callback(i, score)
+        # Wait for results
+        results = [None] * len(batches)
+        for _ in range(len(batches)):
+            task_id, result = self._result_queue.get()
+            
+            # Check for error
+            if isinstance(result, Exception):
+                raise result
                 
-        return scores
+            results[task_id] = result
+            
+        return results
     
-    def _evaluate_batch_parallel(self, 
-                               svg_prompt_pairs: List[Tuple[str, str]], 
-                               callback: Optional[Callable[[int, float], None]] = None) -> List[float]:
-        """
-        Process SVG-prompt pairs in parallel using thread pool.
-        
-        Args:
-            svg_prompt_pairs: List of (svg_code, text_prompt) tuples
-            callback: Optional callback function called with (index, score) after each evaluation
-            
-        Returns:
-            List of similarity scores
-        """
-        # Create thread pool
-        max_workers = min(self.num_workers, len(svg_prompt_pairs))
-        scores = [0.0] * len(svg_prompt_pairs)  # Pre-allocate results list
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all evaluation tasks
-            futures = {}
-            for i, (svg_code, text_prompt) in enumerate(svg_prompt_pairs):
-                future = executor.submit(self.compute_similarity, svg_code, text_prompt)
-                futures[future] = i
-                
-            # Collect results as they complete
-            for future in futures:
-                i = futures[future]
-                try:
-                    score = future.result()
-                    scores[i] = score
-                    
-                    # Call callback if provided
-                    if callback:
-                        callback(i, score)
-                        
-                except Exception as e:
-                    logger.error(f"Error in parallel evaluation task {i}: {str(e)}")
-                    scores[i] = 0.0
-                    
-                    # Call callback with error score
-                    if callback:
-                        callback(i, 0.0)
-                        
-        return scores
-        
-    def get_model_info(self) -> Dict[str, Any]:
-        """
-        Get information about the loaded CLIP model.
-        
-        Returns:
-            Dictionary with model information
-        """
-        if not self.model_loaded:
-            return {"status": "not_loaded", "model_name": self.model_name}
-            
-        info = {
-            "status": "loaded",
-            "model_name": self.model_name,
-            "device": self.device,
-            "precision": self.precision,
-            "image_size": self.image_size
-        }
-        
-        # Add memory usage info if available
-        try:
-            import psutil
-            process = psutil.Process(os.getpid())
-            memory_info = process.memory_info()
-            info["memory_usage"] = {
-                "rss": f"{memory_info.rss / (1024 * 1024):.2f} MB",
-                "vms": f"{memory_info.vms / (1024 * 1024):.2f} MB"
-            }
-        except:
-            pass
-            
-        # Add GPU memory info if available
-        try:
-            torch = self.lazy_importer.get_module("torch")
-            if torch and torch.cuda.is_available():
-                info["gpu_memory"] = {
-                    "allocated": f"{torch.cuda.memory_allocated() / (1024 * 1024):.2f} MB",
-                    "reserved": f"{torch.cuda.memory_reserved() / (1024 * 1024):.2f} MB",
-                    "max_allocated": f"{torch.cuda.max_memory_allocated() / (1024 * 1024):.2f} MB"
-                }
-        except:
-            pass
-            
-        return info
+    def __enter__(self):
+        """Context manager entry."""
+        return self
     
-    def unload_model(self) -> bool:
-        """
-        Unload the CLIP model to free up resources.
-        
-        Returns:
-            Whether the model was successfully unloaded
-        """
-        if not self.model_loaded:
-            return True
-            
-        try:
-            torch = self.lazy_importer.get_module("torch")
-            
-            # Clear processor and model
-            if self.processor:
-                del self.processor
-                self.processor = None
-                
-            if self.model:
-                # Move model to CPU first
-                if torch and self.device != "cpu":
-                    self.model = self.model.to("cpu")
-                    
-                del self.model
-                self.model = None
-                
-            # Clear embedding caches
-            self._text_embedding_cache.clear()
-            self._image_embedding_cache.clear()
-                
-            # Run garbage collection
-            gc.collect()
-            
-            # Clear device caches
-            if torch:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    
-                if hasattr(torch, 'mps') and torch.mps.is_available():
-                    torch.mps.empty_cache()
-                    
-            self.model_loaded = False
-            logger.info("CLIP model unloaded successfully")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error unloading CLIP model: {str(e)}")
-            return False
-    
-    def clear_caches(self) -> None:
-        """Clear all memory caches."""
-        self._svg_cache.clear()
-        self._text_embedding_cache.clear()
-        self._image_embedding_cache.clear()
-        gc.collect()
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.close()

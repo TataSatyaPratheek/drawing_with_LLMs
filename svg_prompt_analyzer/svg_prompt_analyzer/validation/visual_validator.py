@@ -1,856 +1,972 @@
 """
-Visual Validator Module
-===================
-This module provides validation for visual scene layouts to ensure
-spatial coherence, object relationships, and design principles.
+Production-grade SVG validation tool with performance optimizations.
+Validates SVG content against standards, checks for rendering issues,
+and provides optimization suggestions.
 """
 
-import math
+import re
+import os
+import io
+import time
+import warnings
 import logging
-from typing import Dict, Any, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Union, Any, Set, Callable
+from xml.etree import ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import hashlib
 
-from svg_prompt_analyzer.models.scene import Scene
-from svg_prompt_analyzer.models.visual_object import VisualObject, ObjectType
-from svg_prompt_analyzer.models.shape import Shape
-from svg_prompt_analyzer.models.spatial import SpatialRelation
+# Import core optimizations
+from core import CONFIG, memoize, get_thread_pool, Profiler
+from utils.logger import get_logger, log_function_call
 
-logger = logging.getLogger(__name__)
+# Configure logger
+logger = get_logger(__name__)
+
+# Constants for validation
+SVG_NAMESPACE = "http://www.w3.org/2000/svg"
+XLINK_NAMESPACE = "http://www.w3.org/1999/xlink"
+NAMESPACES = {
+    "svg": SVG_NAMESPACE,
+    "xlink": XLINK_NAMESPACE
+}
+
+# Common SVG elements and attributes for validation
+VALID_SVG_ELEMENTS = {
+    "svg", "g", "path", "rect", "circle", "ellipse", "line", "polyline", "polygon",
+    "text", "tspan", "textPath", "image", "use", "defs", "symbol", "linearGradient",
+    "radialGradient", "stop", "clipPath", "mask", "pattern", "marker", "filter",
+    "feBlend", "feColorMatrix", "feComponentTransfer", "feComposite", "feConvolveMatrix",
+    "feDiffuseLighting", "feDisplacementMap", "feFlood", "feGaussianBlur", "feImage",
+    "feMerge", "feMergeNode", "feMorphology", "feOffset", "feSpecularLighting",
+    "feTile", "feTurbulence", "foreignObject", "style", "title", "desc", "metadata",
+    "a", "switch", "view"
+}
+
+# LRU Cache for validators to improve performance
+_validation_cache = {}
+_cache_lock = threading.RLock()
+_MAX_CACHE_SIZE = 1000  # Adjust based on memory constraints
 
 
-class VisualValidator:
+class SVGValidationError(Exception):
+    """Custom exception for SVG validation errors."""
+    pass
+
+
+class ValidationResult:
+    """Results of SVG validation with detailed breakdown."""
+    
+    def __init__(self):
+        self.is_valid = True
+        self.errors = []
+        self.warnings = []
+        self.info = []
+        self.metrics = {
+            "element_count": 0,
+            "depth": 0,
+            "size_bytes": 0,
+            "unique_ids": 0,
+            "complexity_score": 0,
+            "validation_time_ms": 0
+        }
+        self.optimizations = []
+        self._start_time = time.time()
+        
+    def add_error(self, message: str, location: Optional[str] = None):
+        """Add an error to the validation results."""
+        error_info = {"message": message}
+        if location:
+            error_info["location"] = location
+        self.errors.append(error_info)
+        self.is_valid = False
+        
+    def add_warning(self, message: str, location: Optional[str] = None):
+        """Add a warning to the validation results."""
+        warning_info = {"message": message}
+        if location:
+            warning_info["location"] = location
+        self.warnings.append(warning_info)
+        
+    def add_info(self, message: str):
+        """Add information to the validation results."""
+        self.info.append({"message": message})
+        
+    def add_optimization(self, message: str, impact: str = "medium"):
+        """Add an optimization suggestion."""
+        self.optimizations.append({
+            "message": message,
+            "impact": impact
+        })
+        
+    def update_metrics(self, key: str, value: Any):
+        """Update a metric in the validation results."""
+        self.metrics[key] = value
+        
+    def finalize(self):
+        """Finalize validation results and compute metrics."""
+        self.metrics["validation_time_ms"] = int((time.time() - self._start_time) * 1000)
+        return self
+        
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert validation results to a dictionary."""
+        return {
+            "is_valid": self.is_valid,
+            "errors": self.errors,
+            "warnings": self.warnings,
+            "info": self.info,
+            "metrics": self.metrics,
+            "optimizations": self.optimizations
+        }
+
+
+class SVGValidator:
     """
-    Validator for ensuring visual coherence of scenes.
-    Checks for spatial inconsistencies, physical impossibilities, and design principles.
+    Production-grade SVG validation tool with performance optimizations.
+    
+    Validates SVG content against standards, checks for rendering issues,
+    and provides optimization suggestions.
     """
     
-    def __init__(self, 
-                 enforce_physical_constraints: bool = True,
-                 enforce_design_principles: bool = True,
-                 auto_fix: bool = True):
+    def __init__(
+        self,
+        strict_mode: bool = False,
+        check_accessibility: bool = True,
+        validate_rendering: bool = True,
+        max_file_size_kb: int = 500,
+        max_elements: int = 10000,
+        parallelism: int = None
+    ):
         """
-        Initialize the visual validator.
+        Initialize the SVG validator.
         
         Args:
-            enforce_physical_constraints: Whether to enforce physical constraints
-            enforce_design_principles: Whether to enforce design principles
-            auto_fix: Whether to automatically fix issues
+            strict_mode: Whether to enforce strict validation
+            check_accessibility: Whether to check accessibility guidelines
+            validate_rendering: Whether to validate rendering capabilities
+            max_file_size_kb: Maximum allowed file size in KB
+            max_elements: Maximum allowed number of elements
+            parallelism: Number of parallel validation threads
         """
-        self.enforce_physical_constraints = enforce_physical_constraints
-        self.enforce_design_principles = enforce_design_principles
-        self.auto_fix = auto_fix
+        self.strict_mode = strict_mode
+        self.check_accessibility = check_accessibility
+        self.validate_rendering = validate_rendering
+        self.max_file_size_kb = max_file_size_kb
+        self.max_elements = max_elements
         
-    def validate_scene(self, scene: Scene) -> Tuple[bool, List[Dict[str, Any]], Scene]:
-        """
-        Validate a scene for visual coherence.
-        
-        Args:
-            scene: Scene to validate
-            
-        Returns:
-            Tuple of (is_valid, issues, fixed_scene)
-        """
-        issues = []
-        
-        # Create a working copy of the scene
-        working_scene = Scene(
-            id=scene.id,
-            prompt=scene.prompt,
-            background_color=scene.background_color,
-            objects=scene.objects.copy(),
-            width=scene.width,
-            height=scene.height,
-            patterns=scene.patterns.copy() if scene.patterns else {},
-            defs=scene.defs.copy() if scene.defs else [],
-            special_elements=scene.special_elements.copy() if hasattr(scene, 'special_elements') else []
+        # Set up parallelism based on available resources
+        self.parallelism = parallelism or CONFIG.get(
+            "thread_pool_size",
+            min(8, (os.cpu_count() or 4))
         )
         
-        # 1. Validate spatial relationships
-        spatial_issues = self._validate_spatial_relationships(working_scene)
-        issues.extend(spatial_issues)
+        # Initialize thread pool if needed
+        self._thread_pool = None
+
+    def _get_thread_pool(self) -> ThreadPoolExecutor:
+        """Get thread pool for parallel validation."""
+        if self._thread_pool is None:
+            self._thread_pool = get_thread_pool()
+        return self._thread_pool
+
+    @memoize
+    def _compute_file_hash(self, svg_content: str) -> str:
+        """Compute hash of SVG content for caching."""
+        return hashlib.md5(svg_content.encode('utf-8')).hexdigest()
+
+    def _check_cache(self, svg_content: str) -> Optional[ValidationResult]:
+        """Check if validation results are already cached."""
+        file_hash = self._compute_file_hash(svg_content)
         
-        # 2. Validate physical constraints
-        if self.enforce_physical_constraints:
-            physical_issues = self._validate_physical_constraints(working_scene)
-            issues.extend(physical_issues)
+        with _cache_lock:
+            if file_hash in _validation_cache:
+                logger.debug(f"Cache hit for SVG validation: {file_hash}")
+                return _validation_cache[file_hash]
         
-        # 3. Validate design principles
-        if self.enforce_design_principles:
-            design_issues = self._validate_design_principles(working_scene)
-            issues.extend(design_issues)
+        return None
+
+    def _update_cache(self, svg_content: str, result: ValidationResult):
+        """Update validation cache with results."""
+        file_hash = self._compute_file_hash(svg_content)
         
-        # 4. Validate object completeness
-        completeness_issues = self._validate_object_completeness(working_scene)
-        issues.extend(completeness_issues)
-        
-        # 5. Validate z-index coherence
-        z_index_issues = self._validate_z_index_coherence(working_scene)
-        issues.extend(z_index_issues)
-        
-        # Auto-fix issues if enabled
-        if self.auto_fix and issues:
-            logger.info(f"Auto-fixing {len(issues)} visual validation issues")
-            working_scene = self._auto_fix_issues(working_scene, issues)
-        
-        # Scene is valid if there are no remaining issues
-        is_valid = len(issues) == 0
-        
-        return is_valid, issues, working_scene
-    
-    def _validate_spatial_relationships(self, scene: Scene) -> List[Dict[str, Any]]:
+        with _cache_lock:
+            # Add to cache
+            _validation_cache[file_hash] = result
+            
+            # Clean cache if needed
+            if len(_validation_cache) > _MAX_CACHE_SIZE:
+                # Remove oldest entries (approximately 10%)
+                keys_to_remove = list(_validation_cache.keys())[:_MAX_CACHE_SIZE // 10]
+                for key in keys_to_remove:
+                    _validation_cache.pop(key, None)
+
+    @log_function_call(level=logging.DEBUG)
+    def validate(self, svg_content: str) -> ValidationResult:
         """
-        Validate spatial relationships between objects.
+        Validate SVG content with comprehensive checks.
         
         Args:
-            scene: Scene to validate
+            svg_content: SVG content to validate
             
         Returns:
-            List of spatial relationship issues
+            ValidationResult with validation details
         """
-        issues = []
-        
-        # Skip validation if there are not enough objects
-        if len(scene.objects) <= 1:
-            return issues
-        
-        # Check for overlapping objects (unless they have a nesting relationship)
-        for i, obj1 in enumerate(scene.objects):
-            for j, obj2 in enumerate(scene.objects[i+1:], i+1):
-                # Skip validation if either object has no position or size
-                if not hasattr(obj1, 'position') or not hasattr(obj2, 'position'):
-                    continue
-                    
-                if not hasattr(obj1, 'size') or not hasattr(obj2, 'size'):
-                    continue
+        with Profiler("svg_validation"):
+            # Check cache first
+            cached_result = self._check_cache(svg_content)
+            if cached_result is not None:
+                return cached_result
                 
-                # Calculate distance between objects
-                distance = math.hypot(
-                    obj1.position[0] - obj2.position[0],
-                    obj1.position[1] - obj2.position[1]
+            result = ValidationResult()
+            
+            # Basic checks
+            if not self._validate_basic(svg_content, result):
+                # Skip further validation if basic checks fail
+                result.finalize()
+                self._update_cache(svg_content, result)
+                return result
+                
+            try:
+                # Parse SVG
+                root = self._parse_svg(svg_content, result)
+                if root is None:
+                    result.finalize()
+                    self._update_cache(svg_content, result)
+                    return result
+                    
+                # Perform all validations in parallel for performance
+                validations = [
+                    (self._validate_structure, (root, result)),
+                    (self._validate_ids, (root, result)),
+                    (self._validate_css, (root, result)),
+                    (self._validate_paths, (root, result)),
+                    (self._check_optimizations, (root, result, svg_content))
+                ]
+                
+                if self.check_accessibility:
+                    validations.append((self._validate_accessibility, (root, result)))
+                    
+                if self.validate_rendering:
+                    validations.append((self._validate_rendering, (root, result)))
+                
+                # Execute validations in parallel
+                thread_pool = self._get_thread_pool()
+                futures = []
+                
+                for func, args in validations:
+                    futures.append(thread_pool.submit(func, *args))
+                    
+                # Wait for all validations to complete
+                for future in futures:
+                    # Collect any exceptions
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.exception(f"Error during SVG validation: {e}")
+                        result.add_error(f"Validation error: {str(e)}")
+                        
+                # Calculate complexity score
+                self._calculate_complexity(root, result)
+                
+            except Exception as e:
+                logger.exception(f"Unexpected error during SVG validation: {e}")
+                result.add_error(f"Validation failed: {str(e)}")
+                
+            # Finalize and cache results
+            result.finalize()
+            self._update_cache(svg_content, result)
+            return result
+
+    def validate_file(self, file_path: str) -> ValidationResult:
+        """
+        Validate SVG file.
+        
+        Args:
+            file_path: Path to SVG file
+            
+        Returns:
+            ValidationResult with validation details
+        """
+        try:
+            # Validate file exists
+            if not os.path.exists(file_path):
+                result = ValidationResult()
+                result.add_error(f"File not found: {file_path}")
+                return result.finalize()
+                
+            # Check file size
+            file_size_kb = os.path.getsize(file_path) / 1024
+            if file_size_kb > self.max_file_size_kb:
+                result = ValidationResult()
+                result.add_error(
+                    f"File size ({file_size_kb:.1f} KB) exceeds maximum allowed "
+                    f"({self.max_file_size_kb} KB)"
                 )
+                return result.finalize()
                 
-                # Calculate overlap
-                combined_radius = (obj1.size + obj2.size) / 2
-                overlap = combined_radius - distance
+            # Read file with proper encoding detection
+            with open(file_path, 'rb') as f:
+                content = f.read()
                 
-                # Check if objects are overlapping
-                if overlap > 0.01:  # Small threshold to allow minor overlaps
-                    # Check if one object is meant to contain the other
-                    contains_relationship = False
+            # Try to decode as UTF-8
+            try:
+                svg_content = content.decode('utf-8')
+            except UnicodeDecodeError:
+                # Fall back to Latin-1
+                try:
+                    svg_content = content.decode('latin-1')
+                except UnicodeDecodeError:
+                    result = ValidationResult()
+                    result.add_error("Unable to decode file content")
+                    return result.finalize()
                     
-                    # Object 1 contains Object 2
-                    if obj1.size > obj2.size * 1.5 and distance < obj1.size / 2:
-                        contains_relationship = True
-                        
-                        # Ensure proper z-ordering
-                        if obj1.z_index >= obj2.z_index:
-                            issues.append({
-                                "type": "z_index_inconsistency",
-                                "description": f"Object {obj1.name} contains {obj2.name} but has higher or equal z-index",
-                                "severity": "medium",
-                                "objects": [obj1.id, obj2.id],
-                                "fix": "adjust_z_index"
-                            })
-                    
-                    # Object 2 contains Object 1
-                    elif obj2.size > obj1.size * 1.5 and distance < obj2.size / 2:
-                        contains_relationship = True
-                        
-                        # Ensure proper z-ordering
-                        if obj2.z_index >= obj1.z_index:
-                            issues.append({
-                                "type": "z_index_inconsistency",
-                                "description": f"Object {obj2.name} contains {obj1.name} but has higher or equal z-index",
-                                "severity": "medium",
-                                "objects": [obj1.id, obj2.id],
-                                "fix": "adjust_z_index"
-                            })
-                    
-                    # If not a containment relationship, mark as inappropriate overlap
-                    if not contains_relationship:
-                        issues.append({
-                            "type": "inappropriate_overlap",
-                            "description": f"Objects {obj1.name} and {obj2.name} inappropriately overlap",
-                            "severity": "medium",
-                            "objects": [obj1.id, obj2.id],
-                            "overlap_amount": overlap,
-                            "fix": "separate_objects"
-                        })
-        
-        # Check for objects outside the scene bounds
-        for obj in scene.objects:
-            # Skip validation if object has no position or size
-            if not hasattr(obj, 'position') or not hasattr(obj, 'size'):
-                continue
-                
-            # Calculate object bounds in normalized coordinates (0-1)
-            left = obj.position[0] - obj.size / 2
-            right = obj.position[0] + obj.size / 2
-            top = obj.position[1] - obj.size / 2
-            bottom = obj.position[1] + obj.size / 2
+            # Validate content
+            result = self.validate(svg_content)
+            result.update_metrics("size_bytes", len(content))
             
-            # Check if object is outside scene bounds
-            if left < 0 or right > 1 or top < 0 or bottom > 1:
-                issues.append({
-                    "type": "out_of_bounds",
-                    "description": f"Object {obj.name} is outside scene bounds",
-                    "severity": "high",
-                    "object": obj.id,
-                    "position": obj.position,
-                    "size": obj.size,
-                    "fix": "adjust_position"
-                })
-        
-        return issues
-    
-    def _validate_physical_constraints(self, scene: Scene) -> List[Dict[str, Any]]:
+            return result
+            
+        except Exception as e:
+            logger.exception(f"Error validating SVG file {file_path}: {e}")
+            result = ValidationResult()
+            result.add_error(f"File validation error: {str(e)}")
+            return result.finalize()
+
+    def _validate_basic(self, svg_content: str, result: ValidationResult) -> bool:
         """
-        Validate physical constraints of the scene.
+        Perform basic validation checks.
         
         Args:
-            scene: Scene to validate
+            svg_content: SVG content to validate
+            result: ValidationResult to update
             
         Returns:
-            List of physical constraint issues
+            Whether basic validation passed
         """
-        issues = []
+        # Check file size
+        size_bytes = len(svg_content.encode('utf-8'))
+        result.update_metrics("size_bytes", size_bytes)
         
-        # Look for physically impossible object arrangements
-        
-        # Check for floating objects that should be supported
-        ground_bound_types = {
-            ObjectType.ARCHITECTURE, 
-            ObjectType.NATURE
-        }
-        
-        ground_level = 0.8  # Normalized y-coordinate for ground level
-        
-        # Get objects that are on the ground
-        ground_objects = []
-        for obj in scene.objects:
-            # Skip validation if object has no position, size, or type
-            if not hasattr(obj, 'position') or not hasattr(obj, 'size') or not hasattr(obj, 'object_type'):
-                continue
-                
-            # Check if object is a ground object
-            if obj.object_type in ground_bound_types:
-                # Check if object bottom is near ground level
-                obj_bottom = obj.position[1] + obj.size / 2
-                
-                if abs(obj_bottom - ground_level) < 0.1:
-                    ground_objects.append(obj)
-        
-        # Check for objects that should be on the ground but aren't
-        for obj in scene.objects:
-            # Skip validation if object has no position, size, or type
-            if not hasattr(obj, 'position') or not hasattr(obj, 'size') or not hasattr(obj, 'object_type'):
-                continue
-                
-            # Skip objects that aren't ground-bound types
-            if obj.object_type not in ground_bound_types:
-                continue
+        if size_bytes > self.max_file_size_kb * 1024:
+            result.add_error(
+                f"SVG size ({size_bytes / 1024:.1f} KB) exceeds maximum allowed "
+                f"({self.max_file_size_kb} KB)"
+            )
+            return False
             
-            # Check if the object is floating
-            obj_bottom = obj.position[1] + obj.size / 2
+        # Check for SVG header
+        if not re.search(r'<svg[^>]*>', svg_content):
+            result.add_error("Missing SVG root element")
+            return False
             
-            if abs(obj_bottom - ground_level) > 0.1:
-                # Check if it's supported by another object
-                is_supported = False
-                
-                for ground_obj in ground_objects:
-                    # Skip validation if ground object has no position or size
-                    if not hasattr(ground_obj, 'position') or not hasattr(ground_obj, 'size'):
-                        continue
-                        
-                    # Check if object is above and in contact with ground object
-                    horizontal_distance = abs(obj.position[0] - ground_obj.position[0])
-                    vertical_distance = abs(obj.position[1] - ground_obj.position[1])
-                    
-                    if (horizontal_distance < (obj.size + ground_obj.size) / 2 and
-                        vertical_distance < (obj.size + ground_obj.size) / 2):
-                        is_supported = True
-                        break
-                
-                if not is_supported and "float" not in obj.name.lower():
-                    issues.append({
-                        "type": "floating_object",
-                        "description": f"Object {obj.name} is floating without support",
-                        "severity": "medium",
-                        "object": obj.id,
-                        "fix": "ground_object"
-                    })
-        
-        # Check for size inconsistencies
-        object_size_ranges = {
-            ObjectType.ARCHITECTURE: (0.3, 0.7),  # Buildings are large
-            ObjectType.NATURE: (0.1, 0.6),  # Trees, mountains vary in size
-            ObjectType.GEOMETRIC: (0.05, 0.3),  # Geometric shapes are usually smaller
-            ObjectType.CELESTIAL: (0.1, 0.5),  # Sun, moon, stars are medium-sized
-            ObjectType.CLOTHING: (0.2, 0.5),  # Clothing items are medium-sized
-        }
-        
-        for obj in scene.objects:
-            # Skip validation if object has no size or type
-            if not hasattr(obj, 'size') or not hasattr(obj, 'object_type'):
-                continue
-                
-            # Check if object size is within reasonable range
-            if obj.object_type in object_size_ranges:
-                min_size, max_size = object_size_ranges[obj.object_type]
-                
-                if obj.size < min_size:
-                    issues.append({
-                        "type": "object_too_small",
-                        "description": f"Object {obj.name} is unnaturally small for its type",
-                        "severity": "low",
-                        "object": obj.id,
-                        "current_size": obj.size,
-                        "recommended_size": min_size,
-                        "fix": "adjust_size"
-                    })
-                elif obj.size > max_size:
-                    issues.append({
-                        "type": "object_too_large",
-                        "description": f"Object {obj.name} is unnaturally large for its type",
-                        "severity": "low",
-                        "object": obj.id,
-                        "current_size": obj.size,
-                        "recommended_size": max_size,
-                        "fix": "adjust_size"
-                    })
-        
-        return issues
-    
-    def _validate_design_principles(self, scene: Scene) -> List[Dict[str, Any]]:
+        # Check for XML declaration
+        if not svg_content.strip().startswith('<?xml') and self.strict_mode:
+            result.add_warning("Missing XML declaration")
+            
+        # Check for SVG namespace
+        if SVG_NAMESPACE not in svg_content and self.strict_mode:
+            result.add_warning("Missing SVG namespace declaration")
+            
+        # Check for script tags (potential security issue)
+        if '<script' in svg_content:
+            result.add_warning("SVG contains script tags which may pose security risks")
+            
+        # Check for external references
+        if 'xlink:href="http' in svg_content:
+            result.add_warning("SVG contains external references which may not load correctly")
+            
+        return True
+
+    def _parse_svg(self, svg_content: str, result: ValidationResult) -> Optional[ET.Element]:
         """
-        Validate design principles of the scene.
+        Parse SVG content into ElementTree.
         
         Args:
-            scene: Scene to validate
+            svg_content: SVG content to parse
+            result: ValidationResult to update
             
         Returns:
-            List of design principle issues
+            ElementTree root element or None if parsing failed
         """
-        issues = []
-        
-        # Calculate scene center
-        scene_center = (0.5, 0.5)
-        
-        # Calculate visual weight distribution
-        left_weight = 0
-        right_weight = 0
-        top_weight = 0
-        bottom_weight = 0
-        
-        # Track object presence in quadrants
-        quadrants = [0, 0, 0, 0]  # top-left, top-right, bottom-left, bottom-right
-        
-        for obj in scene.objects:
-            # Skip validation if object has no position or size
-            if not hasattr(obj, 'position') or not hasattr(obj, 'size'):
-                continue
+        try:
+            # Register namespaces
+            for prefix, uri in NAMESPACES.items():
+                ET.register_namespace(prefix, uri)
                 
-            # Calculate distance from center
-            dx = obj.position[0] - scene_center[0]
-            dy = obj.position[1] - scene_center[1]
+            # Parse SVG
+            try:
+                tree = ET.fromstring(svg_content)
+            except ET.ParseError as e:
+                result.add_error(f"XML parsing error: {str(e)}")
+                return None
+                
+            # Verify root element is SVG
+            if tree.tag != f"{{{SVG_NAMESPACE}}}svg":
+                result.add_error(f"Root element is not SVG, found: {tree.tag}")
+                return None
+                
+            return tree
             
-            # Calculate visual weight (size squared × importance factor)
-            importance_factor = 1.0
-            if hasattr(obj, 'z_index'):
-                importance_factor = 1.0 + obj.z_index * 0.1
-                
-            visual_weight = obj.size * obj.size * importance_factor
+        except Exception as e:
+            result.add_error(f"Failed to parse SVG: {str(e)}")
+            return None
+
+    def _validate_structure(self, root: ET.Element, result: ValidationResult) -> None:
+        """
+        Validate SVG structure.
+        
+        Args:
+            root: Root SVG element
+            result: ValidationResult to update
+        """
+        # Check SVG attributes
+        if 'width' not in root.attrib and 'height' not in root.attrib and 'viewBox' not in root.attrib:
+            result.add_warning("SVG lacks width, height, and viewBox attributes")
             
-            # Distribute weight
-            if dx < 0:
-                left_weight += visual_weight
-            else:
-                right_weight += visual_weight
-                
-            if dy < 0:
-                top_weight += visual_weight
-            else:
-                bottom_weight += visual_weight
-                
-            # Track quadrant presence
-            quadrant_idx = (1 if dx >= 0 else 0) + (2 if dy >= 0 else 0)
-            quadrants[quadrant_idx] += 1
+        # Count elements and validate
+        element_count = 0
+        element_types = set()
+        max_depth = [0]
         
-        # Check for balance issues
-        horizontal_imbalance = abs(left_weight - right_weight) / max(0.001, left_weight + right_weight)
-        vertical_imbalance = abs(top_weight - bottom_weight) / max(0.001, top_weight + bottom_weight)
-        
-        # If imbalance exceeds threshold, add issue
-        balance_threshold = 0.5  # Allow up to 50% imbalance
-        if horizontal_imbalance > balance_threshold:
-            issues.append({
-                "type": "horizontal_imbalance",
-                "description": "Scene is horizontally imbalanced",
-                "severity": "low",
-                "left_weight": left_weight,
-                "right_weight": right_weight,
-                "imbalance": horizontal_imbalance,
-                "fix": "adjust_balance"
-            })
+        def count_elements(element, depth=0):
+            nonlocal element_count
+            element_count += 1
+            max_depth[0] = max(max_depth[0], depth)
             
-        if vertical_imbalance > balance_threshold:
-            issues.append({
-                "type": "vertical_imbalance",
-                "description": "Scene is vertically imbalanced",
-                "severity": "low",
-                "top_weight": top_weight,
-                "bottom_weight": bottom_weight,
-                "imbalance": vertical_imbalance,
-                "fix": "adjust_balance"
-            })
-        
-        # Check for empty quadrants
-        empty_quadrants = [i for i, count in enumerate(quadrants) if count == 0]
-        if empty_quadrants and len(scene.objects) > 2:  # Only care about empties if we have more than 2 objects
-            issues.append({
-                "type": "empty_quadrants",
-                "description": "Scene has empty quadrants",
-                "severity": "low",
-                "empty_quadrants": empty_quadrants,
-                "fix": "distribute_objects"
-            })
-        
-        # Check for edge crowding (too many objects near edges)
-        edge_threshold = 0.1  # Normalized distance from edge
-        edge_objects = 0
-        
-        for obj in scene.objects:
-            # Skip validation if object has no position or size
-            if not hasattr(obj, 'position') or not hasattr(obj, 'size'):
-                continue
+            # Extract element name without namespace
+            tag = element.tag
+            if '}' in tag:
+                tag = tag.split('}', 1)[1]
                 
-            # Check distance from edges
-            distance_to_edge = min(
-                obj.position[0],               # Distance to left edge
-                1 - obj.position[0],           # Distance to right edge
-                obj.position[1],               # Distance to top edge
-                1 - obj.position[1]            # Distance to bottom edge
+            element_types.add(tag)
+            
+            # Check invalid elements
+            if tag not in VALID_SVG_ELEMENTS and not tag.startswith('fe'):
+                result.add_warning(f"Unknown SVG element: {tag}")
+                
+            # Validate children
+            for child in element:
+                count_elements(child, depth + 1)
+                
+            # Check if element count exceeds limit
+            if element_count > self.max_elements:
+                result.add_error(
+                    f"SVG has too many elements: {element_count} (max: {self.max_elements})"
+                )
+                return
+                
+        # Count elements
+        count_elements(root)
+        
+        # Update metrics
+        result.update_metrics("element_count", element_count)
+        result.update_metrics("depth", max_depth[0])
+        
+        # Check for missing elements
+        if 'path' not in element_types and 'rect' not in element_types and 'circle' not in element_types:
+            result.add_warning("SVG lacks common shape elements (path, rect, circle)")
+
+    def _validate_ids(self, root: ET.Element, result: ValidationResult) -> None:
+        """
+        Validate ID uniqueness and references.
+        
+        Args:
+            root: Root SVG element
+            result: ValidationResult to update
+        """
+        ids = set()
+        references = set()
+        
+        # Find all IDs and references
+        for elem in root.findall(".//*[@id]"):
+            id_value = elem.get('id')
+            if id_value in ids:
+                result.add_error(f"Duplicate ID: {id_value}")
+            ids.add(id_value)
+            
+        # Find all references
+        for elem in root.findall(".//*[@*]"):
+            for attr_name, attr_value in elem.attrib.items():
+                # Check for references in xlink:href, href, or url()
+                if (attr_name.endswith('}href') or attr_name == 'href') and attr_value.startswith('#'):
+                    references.add(attr_value[1:])  # Remove leading #
+                elif 'url(#' in attr_value:
+                    # Extract ID from url(#id)
+                    id_match = re.search(r'url\(#([^)]+)\)', attr_value)
+                    if id_match:
+                        references.add(id_match.group(1))
+                        
+        # Check for broken references
+        for ref in references:
+            if ref not in ids:
+                result.add_warning(f"Reference to non-existent ID: {ref}")
+                
+        # Update metrics
+        result.update_metrics("unique_ids", len(ids))
+
+    def _validate_css(self, root: ET.Element, result: ValidationResult) -> None:
+        """
+        Validate CSS usage.
+        
+        Args:
+            root: Root SVG element
+            result: ValidationResult to update
+        """
+        # Check for style elements
+        style_elements = root.findall(f".//{{{SVG_NAMESPACE}}}style")
+        
+        for style in style_elements:
+            css_content = style.text or ""
+            
+            # Check for browser-specific CSS
+            browser_prefixes = ['-webkit-', '-moz-', '-ms-', '-o-']
+            for prefix in browser_prefixes:
+                if prefix in css_content:
+                    result.add_warning(f"Browser-specific CSS prefix found: {prefix}")
+                    
+            # Check for potential issues
+            if '!important' in css_content:
+                result.add_warning("Use of '!important' in CSS may cause rendering issues")
+                
+        # Check for inline styles
+        inline_style_count = 0
+        for elem in root.findall(".//*[@style]"):
+            inline_style_count += 1
+            
+        if inline_style_count > 20:
+            result.add_optimization(
+                f"Consider using CSS classes instead of {inline_style_count} inline styles",
+                impact="medium"
             )
             
-            if distance_to_edge < edge_threshold:
-                edge_objects += 1
+        # Check for presentation attributes that could be in CSS
+        presentation_attrs = ['fill', 'stroke', 'stroke-width', 'font-size', 'font-family']
+        presentation_attr_count = 0
         
-        # If too many objects are near edges, add issue
-        edge_threshold_pct = 0.5  # Max 50% of objects should be at edges
-        if edge_objects > len(scene.objects) * edge_threshold_pct and len(scene.objects) > 2:
-            issues.append({
-                "type": "edge_crowding",
-                "description": "Too many objects are crowded near the edges",
-                "severity": "low",
-                "edge_objects": edge_objects,
-                "total_objects": len(scene.objects),
-                "fix": "adjust_edge_objects"
-            })
-        
-        return issues
-    
-    def _validate_object_completeness(self, scene: Scene) -> List[Dict[str, Any]]:
+        for attr in presentation_attrs:
+            elements = root.findall(f".//*[@{attr}]")
+            presentation_attr_count += len(elements)
+            
+        if presentation_attr_count > 50:
+            result.add_optimization(
+                f"Consider using CSS for {presentation_attr_count} presentation attributes",
+                impact="medium"
+            )
+
+    def _validate_paths(self, root: ET.Element, result: ValidationResult) -> None:
         """
-        Validate completeness of objects in the scene.
+        Validate SVG paths.
         
         Args:
-            scene: Scene to validate
-            
-        Returns:
-            List of object completeness issues
+            root: Root SVG element
+            result: ValidationResult to update
         """
-        issues = []
+        path_elements = root.findall(f".//{{{SVG_NAMESPACE}}}path")
         
-        for obj in scene.objects:
-            # Check for missing color
-            if not obj.color:
-                issues.append({
-                    "type": "missing_color",
-                    "description": f"Object {obj.name} has no color",
-                    "severity": "medium",
-                    "object": obj.id,
-                    "fix": "add_color"
-                })
+        # Check path data
+        for path in path_elements:
+            path_data = path.get('d', '')
             
-            # Check for missing shapes
-            if not obj.shapes or len(obj.shapes) == 0:
-                issues.append({
-                    "type": "missing_shape",
-                    "description": f"Object {obj.name} has no shape",
-                    "severity": "high",
-                    "object": obj.id,
-                    "fix": "add_shape"
-                })
-        
-        return issues
-    
-    def _validate_z_index_coherence(self, scene: Scene) -> List[Dict[str, Any]]:
-        """
-        Validate z-index coherence of objects in the scene.
-        
-        Args:
-            scene: Scene to validate
+            # Check for non-relative commands
+            absolute_commands = re.findall(r'[MLHVCSQTA]', path_data)
+            relative_commands = re.findall(r'[mlhvcsqta]', path_data)
             
-        Returns:
-            List of z-index coherence issues
-        """
-        issues = []
-        
-        # Skip validation if there are not enough objects
-        if len(scene.objects) <= 1:
-            return issues
-        
-        # Track overlapping objects
-        for i, obj1 in enumerate(scene.objects):
-            for j, obj2 in enumerate(scene.objects[i+1:], i+1):
-                # Skip validation if either object has no position or size
-                if not hasattr(obj1, 'position') or not hasattr(obj2, 'position'):
-                    continue
-                    
-                if not hasattr(obj1, 'size') or not hasattr(obj2, 'size'):
-                    continue
-                
-                # Calculate distance between objects
-                distance = math.hypot(
-                    obj1.position[0] - obj2.position[0],
-                    obj1.position[1] - obj2.position[1]
+            if len(absolute_commands) > 0 and len(relative_commands) == 0:
+                result.add_optimization(
+                    "Consider using relative path commands for smaller file size",
+                    impact="low"
                 )
                 
-                # Calculate overlap
-                combined_radius = (obj1.size + obj2.size) / 2
-                overlap = combined_radius - distance
+            # Check for unnecessarily precise numbers
+            decimal_points = re.findall(r'\d\.\d{5,}', path_data)
+            if decimal_points:
+                result.add_optimization(
+                    "Path data contains unnecessarily precise numbers (>4 decimal places)",
+                    impact="low"
+                )
                 
-                # If objects overlap, check z-index consistency
-                if overlap > 0:
-                    # Get spatial relationship
-                    # Y-coordinates in SVG increase downward, so lower y is "above"
-                    obj1_above = obj1.position[1] < obj2.position[1]
-                    
-                    # Check if z-index is consistent with vertical position
-                    if obj1_above and obj1.z_index <= obj2.z_index:
-                        issues.append({
-                            "type": "z_index_inconsistency",
-                            "description": f"Object {obj1.name} is visually above {obj2.name} but has lower or equal z-index",
-                            "severity": "medium",
-                            "objects": [obj1.id, obj2.id],
-                            "fix": "adjust_z_index"
-                        })
-                    elif not obj1_above and obj1.z_index >= obj2.z_index:
-                        issues.append({
-                            "type": "z_index_inconsistency",
-                            "description": f"Object {obj1.name} is visually below {obj2.name} but has higher or equal z-index",
-                            "severity": "medium",
-                            "objects": [obj1.id, obj2.id],
-                            "fix": "adjust_z_index"
-                        })
-        
-        return issues
-    
-    def _auto_fix_issues(self, scene: Scene, issues: List[Dict[str, Any]]) -> Scene:
+            # Check for potentially malformed path data
+            if not re.match(r'^[mM]', path_data):
+                result.add_warning(f"Path data should start with 'm' or 'M' command")
+
+    def _validate_accessibility(self, root: ET.Element, result: ValidationResult) -> None:
         """
-        Automatically fix issues in the scene.
+        Validate accessibility features.
         
         Args:
-            scene: Scene to fix
-            issues: List of issues to fix
-            
-        Returns:
-            Fixed scene
+            root: Root SVG element
+            result: ValidationResult to update
         """
-        # Create a working copy of the scene
-        fixed_scene = Scene(
-            id=scene.id,
-            prompt=scene.prompt,
-            background_color=scene.background_color,
-            objects=scene.objects.copy(),
-            width=scene.width,
-            height=scene.height,
-            patterns=scene.patterns.copy() if scene.patterns else {},
-            defs=scene.defs.copy() if scene.defs else [],
-            special_elements=scene.special_elements.copy() if hasattr(scene, 'special_elements') else []
+        # Check for title element
+        title_elements = root.findall(f".//{{{SVG_NAMESPACE}}}title")
+        if not title_elements:
+            result.add_warning("Missing <title> element (recommended for accessibility)")
+            
+        # Check for desc element
+        desc_elements = root.findall(f".//{{{SVG_NAMESPACE}}}desc")
+        if not desc_elements:
+            result.add_warning("Missing <desc> element (recommended for accessibility)")
+            
+        # Check for ARIA attributes
+        has_aria = False
+        for elem in root.findall(".//*[@*]"):
+            for attr_name in elem.attrib.keys():
+                if attr_name.startswith('aria-') or attr_name == 'role':
+                    has_aria = True
+                    break
+            if has_aria:
+                break
+                
+        if not has_aria:
+            result.add_warning("No ARIA attributes found (could improve accessibility)")
+            
+        # Check text elements for potential issues
+        text_elements = root.findall(f".//{{{SVG_NAMESPACE}}}text")
+        for text in text_elements:
+            font_size = text.get('font-size')
+            if font_size and font_size.endswith('px') and float(font_size[:-2]) < 12:
+                result.add_warning(f"Text with font-size {font_size} may be too small for readability")
+
+    def _validate_rendering(self, root: ET.Element, result: ValidationResult) -> None:
+        """
+        Validate rendering capabilities.
+        
+        Args:
+            root: Root SVG element
+            result: ValidationResult to update
+        """
+        # Check for filters
+        filter_elements = root.findall(f".//{{{SVG_NAMESPACE}}}filter")
+        if filter_elements:
+            result.add_info(f"SVG uses {len(filter_elements)} filter elements")
+            
+        # Check for masks
+        mask_elements = root.findall(f".//{{{SVG_NAMESPACE}}}mask")
+        if mask_elements:
+            result.add_info(f"SVG uses {len(mask_elements)} mask elements")
+            
+        # Check for patterns
+        pattern_elements = root.findall(f".//{{{SVG_NAMESPACE}}}pattern")
+        if pattern_elements:
+            result.add_info(f"SVG uses {len(pattern_elements)} pattern elements")
+            
+        # Check for advanced features that might not render consistently
+        advanced_features = {
+            'clipPath': f".//{{{SVG_NAMESPACE}}}clipPath",
+            'foreignObject': f".//{{{SVG_NAMESPACE}}}foreignObject",
+            'marker': f".//{{{SVG_NAMESPACE}}}marker",
+            'symbol': f".//{{{SVG_NAMESPACE}}}symbol"
+        }
+        
+        for feature, xpath in advanced_features.items():
+            elements = root.findall(xpath)
+            if elements:
+                result.add_info(f"SVG uses {len(elements)} {feature} elements")
+                
+        # Check for animation elements
+        animation_elements = {
+            'animate': f".//{{{SVG_NAMESPACE}}}animate",
+            'animateTransform': f".//{{{SVG_NAMESPACE}}}animateTransform",
+            'animateMotion': f".//{{{SVG_NAMESPACE}}}animateMotion",
+            'set': f".//{{{SVG_NAMESPACE}}}set"
+        }
+        
+        has_animation = False
+        for feature, xpath in animation_elements.items():
+            elements = root.findall(xpath)
+            if elements:
+                has_animation = True
+                result.add_info(f"SVG uses {len(elements)} {feature} elements")
+                
+        if has_animation:
+            result.add_warning("SVG uses animation which may not be supported in all contexts")
+
+    def _check_optimizations(
+        self, 
+        root: ET.Element, 
+        result: ValidationResult,
+        svg_content: str
+    ) -> None:
+        """
+        Check for potential optimizations.
+        
+        Args:
+            root: Root SVG element
+            result: ValidationResult to update
+            svg_content: Original SVG content
+        """
+        # Check raw file size
+        size_kb = len(svg_content.encode('utf-8')) / 1024
+        
+        # Check for trailing zeros
+        trailing_zeros = re.findall(r'\d+\.0+(?=[^0-9]|$)', svg_content)
+        if trailing_zeros:
+            result.add_optimization(
+                f"Remove {len(trailing_zeros)} unnecessary trailing zeros",
+                impact="low"
+            )
+            
+        # Check for unnecessary precision in transform attributes
+        transform_precision = re.findall(r'transform="[^"]*\d\.\d{5,}[^"]*"', svg_content)
+        if transform_precision:
+            result.add_optimization(
+                f"Reduce precision in {len(transform_precision)} transform attributes",
+                impact="low"
+            )
+            
+        # Check for redundant groups
+        empty_groups = root.findall(f".//{{{SVG_NAMESPACE}}}g[not(*)]")
+        if empty_groups:
+            result.add_optimization(
+                f"Remove {len(empty_groups)} empty group elements",
+                impact="low"
+            )
+            
+        single_child_groups = []
+        for group in root.findall(f".//{{{SVG_NAMESPACE}}}g"):
+            children = list(group)
+            if len(children) == 1 and not group.attrib:
+                single_child_groups.append(group)
+                
+        if single_child_groups:
+            result.add_optimization(
+                f"Simplify {len(single_child_groups)} groups with single child and no attributes",
+                impact="low"
+            )
+            
+        # Check for unnecessary whitespace and comments
+        whitespace_ratio = len(re.findall(r'>\s+<', svg_content)) / max(1, len(svg_content))
+        if whitespace_ratio > 0.05:
+            result.add_optimization(
+                "Minify SVG by removing unnecessary whitespace",
+                impact="medium"
+            )
+            
+        # Check for comments
+        comment_count = len(re.findall(r'<!--.*?-->', svg_content, re.DOTALL))
+        if comment_count > 0:
+            result.add_optimization(
+                f"Remove {comment_count} comments to reduce file size",
+                impact="low"
+            )
+            
+        # Check for unnecessary defaulted attributes
+        default_attrs = [
+            'x="0"', 'y="0"', 'dx="0"', 'dy="0"', 
+            'fill-opacity="1"', 'stroke-opacity="1"',
+            'stroke-width="1"', 'stroke-linecap="butt"',
+            'stroke-linejoin="miter"'
+        ]
+        
+        default_count = 0
+        for attr in default_attrs:
+            default_count += svg_content.count(attr)
+            
+        if default_count > 10:
+            result.add_optimization(
+                f"Remove {default_count} unnecessary default attributes",
+                impact="medium"
+            )
+
+    def _calculate_complexity(self, root: ET.Element, result: ValidationResult) -> None:
+        """
+        Calculate complexity score for the SVG.
+        
+        Args:
+            root: Root SVG element
+            result: ValidationResult to update
+        """
+        # Factors affecting complexity
+        element_count = result.metrics["element_count"]
+        depth = result.metrics["depth"]
+        unique_ids = result.metrics["unique_ids"]
+        
+        # Count special elements
+        special_elements = 0
+        special_tags = [
+            'filter', 'mask', 'pattern', 'clipPath', 'symbol',
+            'linearGradient', 'radialGradient'
+        ]
+        
+        for tag in special_tags:
+            elements = root.findall(f".//{{{SVG_NAMESPACE}}}{tag}")
+            special_elements += len(elements)
+            
+        # Calculate complexity score
+        complexity = element_count * 1.0 + depth * 5.0 + unique_ids * 2.0 + special_elements * 10.0
+        
+        # Normalize to 0-100 scale
+        normalized_complexity = min(100, max(0, complexity / 1000 * 100))
+        
+        result.update_metrics("complexity_score", round(normalized_complexity, 1))
+        
+        # Add recommendation for complex SVGs
+        if normalized_complexity > 70:
+            result.add_optimization(
+                "Consider simplifying SVG due to high complexity score",
+                impact="high"
+            )
+
+
+# Batch validation utility for processing multiple SVGs efficiently
+def batch_validate(
+    svg_files: List[str],
+    validator: Optional[SVGValidator] = None,
+    parallel: bool = True
+) -> Dict[str, ValidationResult]:
+    """
+    Batch validate multiple SVG files with parallelism.
+    
+    Args:
+        svg_files: List of SVG file paths
+        validator: SVGValidator instance or None to create default
+        parallel: Whether to use parallel validation
+        
+    Returns:
+        Dictionary mapping file paths to ValidationResults
+    """
+    # Create validator if not provided
+    if validator is None:
+        validator = SVGValidator()
+        
+    results = {}
+    
+    if parallel:
+        # Use thread pool for parallel validation
+        with ThreadPoolExecutor(max_workers=min(len(svg_files), validator.parallelism)) as executor:
+            # Submit validation tasks
+            futures = {
+                executor.submit(validator.validate_file, file_path): file_path
+                for file_path in svg_files
+            }
+            
+            # Collect results
+            for future in futures:
+                file_path = futures[future]
+                try:
+                    results[file_path] = future.result()
+                except Exception as e:
+                    logger.exception(f"Error validating {file_path}: {e}")
+                    result = ValidationResult()
+                    result.add_error(f"Validation error: {str(e)}")
+                    results[file_path] = result.finalize()
+    else:
+        # Sequential validation
+        for file_path in svg_files:
+            try:
+                results[file_path] = validator.validate_file(file_path)
+            except Exception as e:
+                logger.exception(f"Error validating {file_path}: {e}")
+                result = ValidationResult()
+                result.add_error(f"Validation error: {str(e)}")
+                results[file_path] = result.finalize()
+                
+    return results
+
+
+# Utility function to fix common SVG issues
+def fix_common_issues(svg_content: str) -> Tuple[str, List[str]]:
+    """
+    Fix common SVG issues automatically.
+    
+    Args:
+        svg_content: SVG content to fix
+        
+    Returns:
+        Tuple of (fixed SVG content, list of applied fixes)
+    """
+    fixes = []
+    fixed_content = svg_content
+    
+    # Add XML declaration if missing
+    if not fixed_content.strip().startswith('<?xml'):
+        fixed_content = '<?xml version="1.0" encoding="UTF-8"?>\n' + fixed_content
+        fixes.append("Added XML declaration")
+        
+    # Add SVG namespace if missing
+    svg_ns_pattern = r'<svg[^>]*\s+xmlns=[\'"](http://www\.w3\.org/2000/svg)[\'"]'
+    if not re.search(svg_ns_pattern, fixed_content):
+        fixed_content = re.sub(
+            r'<svg',
+            f'<svg xmlns="{SVG_NAMESPACE}"',
+            fixed_content
         )
+        fixes.append("Added SVG namespace")
         
-        # Create id-to-object mapping for quick lookup
-        object_map = {obj.id: obj for obj in fixed_scene.objects}
+    # Fix missing viewBox if width and height are present
+    width_height_pattern = r'<svg[^>]*\s+width=[\'"](\d+)(?:px)?[\'"][^>]*\s+height=[\'"](\d+)(?:px)?[\'"]'
+    viewbox_pattern = r'<svg[^>]*\s+viewBox=[\'"][^\'"]*[\'"]'
+    
+    if not re.search(viewbox_pattern, fixed_content):
+        width_height_match = re.search(width_height_pattern, fixed_content)
+        if width_height_match:
+            width, height = width_height_match.groups()
+            fixed_content = re.sub(
+                r'<svg',
+                f'<svg viewBox="0 0 {width} {height}"',
+                fixed_content
+            )
+            fixes.append(f"Added viewBox='0 0 {width} {height}' based on width/height")
+            
+    # Remove unnecessary decimal places
+    original_length = len(fixed_content)
+    fixed_content = re.sub(r'(\d+\.\d{4})\d+', r'\1', fixed_content)
+    if len(fixed_content) < original_length:
+        fixes.append("Reduced decimal precision to 4 places")
         
-        # Apply fixes for each issue type
-        for issue in issues:
-            issue_type = issue.get("type")
-            fix_type = issue.get("fix")
-            
-            if issue_type == "inappropriate_overlap" and fix_type == "separate_objects":
-                # Get objects involved
-                obj1_id, obj2_id = issue.get("objects", [None, None])
-                obj1 = object_map.get(obj1_id)
-                obj2 = object_map.get(obj2_id)
-                
-                if obj1 and obj2:
-                    # Calculate vector between objects
-                    dx = obj2.position[0] - obj1.position[0]
-                    dy = obj2.position[1] - obj1.position[1]
-                    distance = math.hypot(dx, dy)
-                    
-                    # Normalize vector
-                    if distance > 0:
-                        dx /= distance
-                        dy /= distance
-                    else:
-                        # If objects are exactly at same position, move arbitrarily
-                        dx, dy = 1, 0
-                    
-                    # Calculate required separation
-                    overlap = issue.get("overlap_amount", 0)
-                    separation = overlap * 1.1  # Add a small buffer
-                    
-                    # Move objects apart
-                    obj1.position = (
-                        obj1.position[0] - dx * separation / 2,
-                        obj1.position[1] - dy * separation / 2
-                    )
-                    
-                    obj2.position = (
-                        obj2.position[0] + dx * separation / 2,
-                        obj2.position[1] + dy * separation / 2
-                    )
-            
-            elif issue_type == "out_of_bounds" and fix_type == "adjust_position":
-                # Get object involved
-                obj_id = issue.get("object")
-                obj = object_map.get(obj_id)
-                
-                if obj:
-                    # Get current position and size
-                    x, y = obj.position
-                    size = obj.size
-                    
-                    # Calculate bounds
-                    left = x - size / 2
-                    right = x + size / 2
-                    top = y - size / 2
-                    bottom = y + size / 2
-                    
-                    # Adjust position to bring within bounds
-                    if left < 0:
-                        x += -left
-                    elif right > 1:
-                        x -= (right - 1)
-                        
-                    if top < 0:
-                        y += -top
-                    elif bottom > 1:
-                        y -= (bottom - 1)
-                        
-                    # Update position
-                    obj.position = (x, y)
-            
-            elif issue_type == "z_index_inconsistency" and fix_type == "adjust_z_index":
-                # Get objects involved
-                obj_ids = issue.get("objects", [])
-                
-                if len(obj_ids) == 2:
-                    obj1_id, obj2_id = obj_ids
-                    obj1 = object_map.get(obj1_id)
-                    obj2 = object_map.get(obj2_id)
-                    
-                    if obj1 and obj2:
-                        # Swap z-indexes
-                        temp_z = obj1.z_index
-                        obj1.z_index = obj2.z_index + 1  # Ensure no overlap
-                        obj2.z_index = temp_z - 1
-            
-            elif issue_type == "floating_object" and fix_type == "ground_object":
-                # Get object involved
-                obj_id = issue.get("object")
-                obj = object_map.get(obj_id)
-                
-                if obj:
-                    # Move to ground level
-                    ground_y = 0.8  # Normalized y-coordinate for ground
-                    new_y = ground_y - obj.size / 2
-                    
-                    # Update position
-                    obj.position = (obj.position[0], new_y)
-            
-            elif (issue_type == "object_too_small" or issue_type == "object_too_large") and fix_type == "adjust_size":
-                # Get object involved
-                obj_id = issue.get("object")
-                obj = object_map.get(obj_id)
-                
-                if obj:
-                    # Get recommended size
-                    recommended_size = issue.get("recommended_size")
-                    
-                    if recommended_size:
-                        # Update size
-                        obj.size = recommended_size
-            
-            elif issue_type == "missing_color" and fix_type == "add_color":
-                # Get object involved
-                obj_id = issue.get("object")
-                obj = object_map.get(obj_id)
-                
-                if obj:
-                    # Add a default color based on object type
-                    from svg_prompt_analyzer.models.color import Color
-                    
-                    # Choose color based on object type
-                    color_map = {
-                        ObjectType.NATURE: "green",
-                        ObjectType.ARCHITECTURE: "gray",
-                        ObjectType.GEOMETRIC: "blue",
-                        ObjectType.CELESTIAL: "yellow",
-                        ObjectType.CLOTHING: "red",
-                        ObjectType.ABSTRACT: "purple"
-                    }
-                    
-                    color_name = color_map.get(obj.object_type, "gray")
-                    obj.color = Color(name=color_name)
-            
-            elif issue_type == "missing_shape" and fix_type == "add_shape":
-                # Get object involved
-                obj_id = issue.get("object")
-                obj = object_map.get(obj_id)
-                
-                if obj:
-                    # Add a default shape based on object type
-                    from svg_prompt_analyzer.models.shape import Shape, Attribute
-                    
-                    # Choose shape based on object type
-                    shape_map = {
-                        ObjectType.NATURE: "triangle",  # Tree-like
-                        ObjectType.ARCHITECTURE: "rectangle",  # Building-like
-                        ObjectType.GEOMETRIC: "circle",  # Basic geometric
-                        ObjectType.CELESTIAL: "circle",  # Sun, moon, stars
-                        ObjectType.CLOTHING: "rectangle",  # Clothing item
-                        ObjectType.ABSTRACT: "rectangle"  # Default
-                    }
-                    
-                    shape_type = shape_map.get(obj.object_type, "rectangle")
-                    
-                    # Create shape
-                    shape = Shape(
-                        shape_type=shape_type,
-                        attributes=[
-                            Attribute("fill", obj.color.hex_code if obj.color else "#808080"),
-                            Attribute("stroke", "#000000"),
-                            Attribute("stroke-width", 1)
-                        ]
-                    )
-                    
-                    # Add shape to object
-                    obj.shapes = [shape]
-            
-            elif issue_type == "horizontal_imbalance" and fix_type == "adjust_balance":
-                # Get imbalance data
-                left_weight = issue.get("left_weight", 0)
-                right_weight = issue.get("right_weight", 0)
-                
-                # Determine which side is heavier
-                left_heavier = left_weight > right_weight
-                
-                # Find movable objects on heavier side
-                movable_objects = []
-                for obj in fixed_scene.objects:
-                    # Skip validation if object has no position
-                    if not hasattr(obj, 'position'):
-                        continue
-                        
-                    # Check if object is on heavier side
-                    on_left = obj.position[0] < 0.5
-                    
-                    if on_left == left_heavier:
-                        movable_objects.append(obj)
-                
-                # Sort by distance from center
-                movable_objects.sort(key=lambda obj: abs(obj.position[0] - 0.5))
-                
-                # Move the most central object toward the lighter side
-                if movable_objects:
-                    obj = movable_objects[0]
-                    # Move halfway to center
-                    new_x = (obj.position[0] + 0.5) / 2
-                    obj.position = (new_x, obj.position[1])
-            
-            elif issue_type == "vertical_imbalance" and fix_type == "adjust_balance":
-                # Get imbalance data
-                top_weight = issue.get("top_weight", 0)
-                bottom_weight = issue.get("bottom_weight", 0)
-                
-                # Determine which side is heavier
-                top_heavier = top_weight > bottom_weight
-                
-                # Find movable objects on heavier side
-                movable_objects = []
-                for obj in fixed_scene.objects:
-                    # Skip validation if object has no position
-                    if not hasattr(obj, 'position'):
-                        continue
-                        
-                    # Check if object is on heavier side
-                    on_top = obj.position[1] < 0.5
-                    
-                    if on_top == top_heavier:
-                        movable_objects.append(obj)
-                
-                # Sort by distance from center
-                movable_objects.sort(key=lambda obj: abs(obj.position[1] - 0.5))
-                
-                # Move the most central object toward the lighter side
-                if movable_objects:
-                    obj = movable_objects[0]
-                    # Move halfway to center
-                    new_y = (obj.position[1] + 0.5) / 2
-                    obj.position = (obj.position[0], new_y)
-            
-            elif issue_type == "empty_quadrants" and fix_type == "distribute_objects":
-                # Get empty quadrants
-                empty_quadrants = issue.get("empty_quadrants", [])
-                
-                if empty_quadrants:
-                    # Find smallest objects that could be moved
-                    movable_objects = sorted(fixed_scene.objects, key=lambda obj: obj.size)
-                    
-                    # Move one object to each empty quadrant
-                    for i, quadrant in enumerate(empty_quadrants):
-                        if i < len(movable_objects):
-                            obj = movable_objects[i]
-                            
-                            # Calculate quadrant center
-                            quadrant_x = 0.25 if quadrant in [0, 2] else 0.75
-                            quadrant_y = 0.25 if quadrant in [0, 1] else 0.75
-                            
-                            # Move object to quadrant
-                            obj.position = (quadrant_x, quadrant_y)
-            
-            elif issue_type == "edge_crowding" and fix_type == "adjust_edge_objects":
-                # Find objects near edges
-                edge_threshold = 0.1  # Normalized distance from edge
-                edge_objects = []
-                
-                for obj in fixed_scene.objects:
-                    # Skip validation if object has no position
-                    if not hasattr(obj, 'position'):
-                        continue
-                        
-                    # Check distance from edges
-                    distance_to_edge = min(
-                        obj.position[0],               # Distance to left edge
-                        1 - obj.position[0],           # Distance to right edge
-                        obj.position[1],               # Distance to top edge
-                        1 - obj.position[1]            # Distance to bottom edge
-                    )
-                    
-                    if distance_to_edge < edge_threshold:
-                        edge_objects.append(obj)
-                
-                # Sort by size (smaller objects are easier to move)
-                edge_objects.sort(key=lambda obj: obj.size)
-                
-                # Move half of edge objects toward center
-                for i, obj in enumerate(edge_objects[:len(edge_objects)//2]):
-                    # Move toward center
-                    new_x = (obj.position[0] + 0.5) / 2
-                    new_y = (obj.position[1] + 0.5) / 2
-                    
-                    obj.position = (new_x, new_y)
+    # Remove empty groups
+    original_length = len(fixed_content)
+    fixed_content = re.sub(r'<g[^>]*>\s*</g>', '', fixed_content)
+    if len(fixed_content) < original_length:
+        fixes.append("Removed empty groups")
         
-        return fixed_scene
+    # Remove comments
+    original_length = len(fixed_content)
+    fixed_content = re.sub(r'<!--.*?-->', '', fixed_content, flags=re.DOTALL)
+    if len(fixed_content) < original_length:
+        fixes.append("Removed comments")
+        
+    # Remove default attribute values
+    default_attrs = [
+        (r'\s+x="0"', ''),
+        (r'\s+y="0"', ''),
+        (r'\s+dx="0"', ''),
+        (r'\s+dy="0"', ''),
+        (r'\s+fill-opacity="1"', ''),
+        (r'\s+stroke-opacity="1"', ''),
+        (r'\s+stroke-width="1"', ''),
+        (r'\s+stroke-linecap="butt"', ''),
+        (r'\s+stroke-linejoin="miter"', '')
+    ]
+    
+    for pattern, replacement in default_attrs:
+        original_length = len(fixed_content)
+        fixed_content = re.sub(pattern, replacement, fixed_content)
+        if len(fixed_content) < original_length:
+            attr_name = pattern.split('"')[0].strip()
+            fixes.append(f"Removed default {attr_name} attributes")
+            
+    # Remove unnecessary whitespace
+    original_length = len(fixed_content)
+    fixed_content = re.sub(r'>\s+<', '><', fixed_content)
+    if len(fixed_content) < original_length:
+        fixes.append("Removed unnecessary whitespace")
+        
+    return fixed_content, fixes
+
+
+# Export main validation function for direct use
+def validate_svg(svg_content: str, **kwargs) -> Dict[str, Any]:
+    """
+    Validate SVG content and return results as a dictionary.
+    
+    Args:
+        svg_content: SVG content to validate
+        **kwargs: Additional arguments for SVGValidator
+        
+    Returns:
+        Validation results as a dictionary
+    """
+    validator = SVGValidator(**kwargs)
+    result = validator.validate(svg_content)
+    return result.to_dict()
