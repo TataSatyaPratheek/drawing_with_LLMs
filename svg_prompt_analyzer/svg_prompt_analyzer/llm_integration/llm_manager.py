@@ -1147,3 +1147,403 @@ class LLMManager:
         # Ensure padding token is set
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+    
+    def enable_gradient_checkpointing(self) -> None:
+        """
+        Enable gradient checkpointing for transformer models to reduce memory usage.
+        This allows processing longer sequences with the same memory budget.
+        """
+        try:
+            # Check if model is loaded
+            if not hasattr(self, 'model') or self.model is None:
+                logger.warning("Cannot enable gradient checkpointing: model not loaded")
+                return
+                
+            # Enable gradient checkpointing if supported
+            if hasattr(self.model, 'gradient_checkpointing_enable'):
+                self.model.gradient_checkpointing_enable()
+                logger.info("Gradient checkpointing enabled successfully")
+            elif hasattr(self.model, 'enable_gradient_checkpointing'):
+                self.model.enable_gradient_checkpointing()
+                logger.info("Gradient checkpointing enabled successfully")
+            else:
+                # Try to access the model's transformer attribute
+                if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'gradient_checkpointing_enable'):
+                    self.model.transformer.gradient_checkpointing_enable()
+                    logger.info("Gradient checkpointing enabled on transformer")
+                else:
+                    logger.warning("Model does not support gradient checkpointing")
+                    
+        except Exception as e:
+            logger.error(f"Error enabling gradient checkpointing: {str(e)}")
+
+    def disable_gradient_checkpointing(self) -> None:
+        """
+        Disable gradient checkpointing for transformer models.
+        """
+        try:
+            # Check if model is loaded
+            if not hasattr(self, 'model') or self.model is None:
+                return
+                
+            # Disable gradient checkpointing if supported
+            if hasattr(self.model, 'gradient_checkpointing_disable'):
+                self.model.gradient_checkpointing_disable()
+                logger.info("Gradient checkpointing disabled")
+            elif hasattr(self.model, 'disable_gradient_checkpointing'):
+                self.model.disable_gradient_checkpointing()
+                logger.info("Gradient checkpointing disabled")
+            else:
+                # Try to access the model's transformer attribute
+                if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'gradient_checkpointing_disable'):
+                    self.model.transformer.gradient_checkpointing_disable()
+                    logger.info("Gradient checkpointing disabled on transformer")
+                    
+        except Exception as e:
+            logger.error(f"Error disabling gradient checkpointing: {str(e)}")
+
+    def generate_batch(self, 
+                    prompts: List[str],
+                    max_tokens: int = 1024,
+                    temperature: float = 0.7,
+                    top_p: float = 0.9,
+                    stop_sequences: Optional[List[str]] = None,
+                    use_cache: bool = True) -> List[str]:
+        """
+        Generate responses for multiple prompts in a batch.
+        
+        Args:
+            prompts: List of prompts to generate from
+            max_tokens: Maximum number of tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling parameter
+            stop_sequences: List of sequences that stop generation
+            use_cache: Whether to use response cache
+            
+        Returns:
+            List of generated responses
+        """
+        # Check for empty input
+        if not prompts:
+            return []
+            
+        # If only one prompt, use regular generation
+        if len(prompts) == 1:
+            response = self.generate(
+                role="default",
+                prompt=prompts[0],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop_sequences=stop_sequences,
+                use_cache=use_cache
+            )
+            return [response]
+            
+        # Check cache for each prompt
+        if use_cache and hasattr(self, 'response_cache'):
+            cached_responses = []
+            uncached_prompts = []
+            uncached_indices = []
+            
+            for i, prompt in enumerate(prompts):
+                cache_key = self._get_cache_key(prompt, max_tokens, temperature, top_p)
+                if cache_key in self.response_cache:
+                    cached_responses.append((i, self.response_cache[cache_key]))
+                else:
+                    uncached_prompts.append(prompt)
+                    uncached_indices.append(i)
+            
+            # If all prompts are cached, return responses
+            if len(cached_responses) == len(prompts):
+                # Sort by original index
+                sorted_responses = sorted(cached_responses, key=lambda x: x[0])
+                return [response for _, response in sorted_responses]
+                
+            # Otherwise, generate only uncached prompts
+            prompts_to_generate = uncached_prompts
+        else:
+            # Generate all prompts
+            prompts_to_generate = prompts
+            uncached_indices = list(range(len(prompts)))
+        
+        # Determine optimal batch size based on available memory and model
+        batch_size = self._calculate_optimal_batch_size(
+            prompts_to_generate, 
+            max_tokens
+        )
+        
+        logger.info(f"Generating batch of {len(prompts_to_generate)} prompts "
+                    f"with batch size {batch_size}")
+        
+        # Generate in batches
+        all_outputs = [""] * len(prompts)
+        
+        # Enable gradient checkpointing for memory efficiency
+        self.enable_gradient_checkpointing()
+        
+        try:
+            # Convert prompts to input tensors
+            input_batches = []
+            
+            for i in range(0, len(prompts_to_generate), batch_size):
+                batch_prompts = prompts_to_generate[i:i+batch_size]
+                batch_inputs = self._prepare_batch_inputs(batch_prompts)
+                input_batches.append(batch_inputs)
+            
+            # Process each batch
+            batch_start_time = time.time()
+            
+            for batch_index, batch_inputs in enumerate(input_batches):
+                batch_outputs = self._generate_batch_outputs(
+                    batch_inputs,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop_sequences=stop_sequences
+                )
+                
+                # Update results
+                start_idx = batch_index * batch_size
+                for i, output in enumerate(batch_outputs):
+                    orig_idx = uncached_indices[start_idx + i]
+                    all_outputs[orig_idx] = output
+                    
+                    # Update cache
+                    if use_cache and hasattr(self, 'response_cache'):
+                        prompt = prompts_to_generate[start_idx + i]
+                        cache_key = self._get_cache_key(prompt, max_tokens, temperature, top_p)
+                        self.response_cache[cache_key] = output
+            
+            batch_time = time.time() - batch_start_time
+            logger.info(f"Batch generation completed in {batch_time:.2f}s "
+                        f"({len(prompts_to_generate) / batch_time:.2f} prompts/s)")
+            
+        except Exception as e:
+            logger.error(f"Error in batch generation: {str(e)}")
+            # Fill missing outputs with error message
+            for i, output in enumerate(all_outputs):
+                if not output:
+                    all_outputs[i] = f"Error: {str(e)}"
+        
+        finally:
+            # Disable gradient checkpointing to return to normal mode
+            self.disable_gradient_checkpointing()
+            
+            # Run garbage collection
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Fill in cached responses
+        if use_cache and hasattr(self, 'response_cache'):
+            for i, response in cached_responses:
+                all_outputs[i] = response
+        
+        return all_outputs
+
+    def _calculate_optimal_batch_size(self, prompts: List[str], max_tokens: int) -> int:
+        """
+        Calculate optimal batch size based on available memory and prompt lengths.
+        
+        Args:
+            prompts: List of prompts
+            max_tokens: Maximum number of tokens to generate
+            
+        Returns:
+            Optimal batch size
+        """
+        # Default conservative batch size
+        default_batch_size = 1
+        
+        try:
+            # Get average prompt length
+            avg_prompt_len = sum(len(p.split()) for p in prompts) / len(prompts)
+            
+            # Estimate tokens per prompt (rough approximation)
+            tokens_per_prompt = avg_prompt_len * 1.3  # 1.3 tokens per word on average
+            
+            # Estimate memory required per sequence
+            if torch.cuda.is_available():
+                # Check available GPU memory
+                device = torch.cuda.current_device()
+                total_memory = torch.cuda.get_device_properties(device).total_memory
+                allocated_memory = torch.cuda.memory_allocated(device)
+                free_memory = total_memory - allocated_memory
+                
+                # Estimate memory per sequence based on model size and sequence length
+                # This is a very rough estimate and should be calibrated for your model
+                model_size = 0
+                if hasattr(self, 'model'):
+                    # Get model size in parameters
+                    model_size = sum(p.numel() for p in self.model.parameters())
+                
+                # Memory per token varies by model architecture
+                # For transformers, it's roughly proportional to the square of the sequence length
+                # due to attention mechanisms
+                seq_len = tokens_per_prompt + max_tokens
+                
+                # Memory usage grows quadratically with sequence length for attention
+                mem_per_seq = 2 * model_size * 4  # 4 bytes per parameter (float32)
+                mem_per_seq += seq_len * seq_len * 16  # Attention matrices
+                mem_per_seq += seq_len * 4 * 12  # Various activations
+                
+                # Add safety factor
+                mem_per_seq *= 1.5
+                
+                # Calculate batch size
+                if mem_per_seq > 0:
+                    max_batch_size = int(free_memory / mem_per_seq)
+                    # Constrain to reasonable range
+                    batch_size = max(1, min(8, max_batch_size))
+                    
+                    logger.debug(f"Calculated batch size: {batch_size} (free memory: {free_memory/1e9:.2f}GB, "
+                            f"estimated memory per sequence: {mem_per_seq/1e9:.2f}GB)")
+                    
+                    return batch_size
+            
+            # CPU-based batch size calculation
+            # More conservative since CPU memory is shared with other processes
+            if hasattr(self, 'model') and hasattr(self.model, 'config'):
+                if hasattr(self.model.config, 'model_type'):
+                    # Different models have different memory characteristics
+                    model_type = self.model.config.model_type.lower()
+                    
+                    if 'gpt' in model_type:
+                        return min(2, len(prompts))
+                    elif 'llama' in model_type:
+                        return min(2, len(prompts))
+                    elif 'mistral' in model_type:
+                        return min(2, len(prompts))
+                    elif 'falcon' in model_type:
+                        return min(2, len(prompts))
+                    else:
+                        return min(4, len(prompts))
+            
+            # Default to conservative batch size
+            return min(default_batch_size, len(prompts))
+            
+        except Exception as e:
+            logger.error(f"Error calculating batch size: {str(e)}")
+            return default_batch_size
+
+    def _prepare_batch_inputs(self, prompts: List[str]) -> Dict[str, Any]:
+        """
+        Prepare inputs for batch generation.
+        
+        Args:
+            prompts: List of prompts
+            
+        Returns:
+            Dict of model inputs
+        """
+        # This is a simplified implementation
+        # The actual implementation would depend on the tokenizer and model
+        
+        try:
+            if not hasattr(self, 'tokenizer'):
+                raise ValueError("Tokenizer not initialized")
+                
+            # Tokenize prompts
+            tokenized_inputs = self.tokenizer(
+                prompts,
+                padding=True,
+                truncation=True,
+                return_tensors="pt"
+            )
+            
+            # Move to appropriate device
+            device = "cpu"
+            if hasattr(self, 'device'):
+                device = self.device
+                
+            for key in tokenized_inputs:
+                if torch.is_tensor(tokenized_inputs[key]):
+                    tokenized_inputs[key] = tokenized_inputs[key].to(device)
+            
+            return tokenized_inputs
+            
+        except Exception as e:
+            logger.error(f"Error preparing batch inputs: {str(e)}")
+            raise
+
+    def _generate_batch_outputs(self, 
+                            batch_inputs: Dict[str, Any],
+                            max_tokens: int,
+                            temperature: float,
+                            top_p: float,
+                            stop_sequences: Optional[List[str]]) -> List[str]:
+        """
+        Generate outputs for a batch of inputs.
+        
+        Args:
+            batch_inputs: Dict of model inputs
+            max_tokens: Maximum number of tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling parameter
+            stop_sequences: List of sequences that stop generation
+            
+        Returns:
+            List of generated outputs
+        """
+        # This is a simplified implementation
+        # The actual implementation would depend on the model
+        
+        try:
+            if not hasattr(self, 'model') or not hasattr(self, 'tokenizer'):
+                raise ValueError("Model or tokenizer not initialized")
+                
+            # Prepare generation config
+            gen_kwargs = {
+                "max_new_tokens": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "do_sample": temperature > 0,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "eos_token_id": self.tokenizer.eos_token_id,
+            }
+            
+            # Add stop sequences if provided
+            if stop_sequences:
+                stop_token_ids = []
+                for seq in stop_sequences:
+                    # Check if sequence is already tokenized
+                    if isinstance(seq, list) and all(isinstance(x, int) for x in seq):
+                        stop_token_ids.extend(seq)
+                    else:
+                        # Tokenize sequence
+                        token_ids = self.tokenizer.encode(seq, add_special_tokens=False)
+                        stop_token_ids.append(token_ids[-1])  # Just use the last token as stop signal
+                
+                if stop_token_ids:
+                    gen_kwargs["eos_token_id"] = stop_token_ids
+            
+            # Generate with model
+            with torch.no_grad():
+                outputs = self.model.generate(**batch_inputs, **gen_kwargs)
+            
+            # Decode outputs
+            decoded_outputs = []
+            
+            for i, output in enumerate(outputs):
+                # Find the input length for this example
+                input_ids = batch_inputs["input_ids"][i]
+                input_len = len(input_ids) - (input_ids == self.tokenizer.pad_token_id).sum()
+                
+                # Decode only the generated part (excluding input)
+                generated_tokens = output[input_len:]
+                decoded = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                
+                # Apply stop sequences
+                if stop_sequences:
+                    for stop_seq in stop_sequences:
+                        if stop_seq in decoded:
+                            decoded = decoded[:decoded.index(stop_seq)]
+                
+                decoded_outputs.append(decoded)
+            
+            return decoded_outputs
+            
+        except Exception as e:
+            logger.error(f"Error generating batch outputs: {str(e)}")
+            return ["Error: " + str(e)] * len(batch_inputs["input_ids"])
