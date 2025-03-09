@@ -14,9 +14,11 @@ import threading
 import time
 import platform
 import multiprocessing
-from typing import Dict, Any, Optional, List, Union, Tuple
+import queue
+from typing import Dict, Any, Optional, List, Union, Tuple, Callable
 from pathlib import Path
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +128,7 @@ class LazyImporter:
 DEFAULT_MODELS = {
     "prompt_analyzer": "mistralai/Mistral-7B-Instruct-v0.2",  # For prompt analysis
     "svg_generator": "deepseek-ai/deepseek-coder-6.7b-instruct",  # For SVG generation
+    "scene_elaborator": "mistralai/Mistral-7B-Instruct-v0.2",  # For scene elaboration
 }
 
 class LLMManager:
@@ -151,7 +154,9 @@ class LLMManager:
                  use_8bit: bool = True,
                  use_4bit: bool = False,
                  max_memory: Optional[Dict[str, str]] = None,
-                 offload_folder: Optional[str] = None):
+                 offload_folder: Optional[str] = None,
+                 max_batch_size: int = 8,
+                 enable_gradient_checkpointing: bool = True):
         """
         Initialize the LLM Manager with model configurations.
         
@@ -163,6 +168,8 @@ class LLMManager:
             use_4bit: Whether to use 4-bit quantization (takes precedence over 8-bit)
             max_memory: Memory constraints per device {"cuda:0": "8GiB", "cpu": "32GiB"}
             offload_folder: Directory for offloading model parts to disk
+            max_batch_size: Maximum batch size for generation
+            enable_gradient_checkpointing: Whether to use gradient checkpointing
         """
         # Initialize only once (singleton pattern)
         if hasattr(self, 'initialized'):
@@ -174,6 +181,8 @@ class LLMManager:
         self.loaded_models = {}
         self.model_info = {}
         self.offload_folder = offload_folder
+        self.max_batch_size = max_batch_size
+        self.enable_gradient_checkpointing = enable_gradient_checkpointing
         
         # Create offload folder if specified
         if self.offload_folder:
@@ -198,6 +207,13 @@ class LLMManager:
         # Caching for generated responses
         self.response_cache = {}
         self.cache_size_limit = 100  # Number of responses to keep in cache
+        
+        # Batch processing
+        self._batch_queue = queue.Queue()
+        self._batch_results = {}
+        self._batch_lock = threading.Lock()
+        self._batch_thread = None
+        self._batch_processing = False
         
         # Track initialization status
         self.initialized = True
@@ -550,6 +566,10 @@ class LLMManager:
             # For CPU, consider using "auto" device map for potential optimizations
             config["device_map"] = "auto"
             
+        # Gradient checkpointing
+        if self.enable_gradient_checkpointing:
+            config["gradient_checkpointing"] = True
+            
         # Quantization settings - 4-bit takes precedence
         if self.use_4bit and self.lazy_importer.import_bitsandbytes():
             torch = self.lazy_importer.get_module("torch")
@@ -602,6 +622,10 @@ class LLMManager:
             # Enable MKL optimizations if available
             if hasattr(torch, 'set_num_interop_threads'):
                 torch.set_num_interop_threads(max(1, DEVICE_INFO["cpu_cores"] // 2))
+        
+        # Enable gradient checkpointing if requested
+        if self.enable_gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable()
                 
     def _get_model_size(self, model: Any) -> str:
         """
@@ -790,6 +814,172 @@ class LLMManager:
             error_msg = f"Error during generation with model {role}: {str(e)}"
             logger.error(error_msg)
             return error_msg
+            
+    def generate_batch(self, 
+                     role: str, 
+                     prompts: List[str], 
+                     max_tokens: int = 1024, 
+                     temperature: float = 0.7,
+                     stop_sequences: Optional[List[str]] = None,
+                     use_cache: bool = True,
+                     batch_size: Optional[int] = None) -> List[str]:
+        """
+        Generate text for multiple prompts in an optimized batch.
+        
+        Args:
+            role: Role of the model to use
+            prompts: List of prompts to generate from
+            max_tokens: Maximum number of tokens to generate
+            temperature: Generation temperature
+            stop_sequences: Sequences that will stop generation
+            use_cache: Whether to use response caching
+            batch_size: Maximum batch size (defaults to self.max_batch_size)
+            
+        Returns:
+            List of generated texts in same order as prompts
+        """
+        if not prompts:
+            return []
+            
+        # Use default batch size if not specified
+        if batch_size is None:
+            batch_size = self.max_batch_size
+            
+        # Limit batch size to max_batch_size
+        batch_size = min(batch_size, self.max_batch_size)
+            
+        # For small number of prompts, just use individual generation
+        if len(prompts) == 1:
+            return [self.generate(role, prompts[0], max_tokens, temperature, 1, stop_sequences, None, use_cache)]
+        
+        # Check cache first for all prompts
+        results = [None] * len(prompts)
+        prompts_to_generate = []
+        indices_to_generate = []
+        
+        if use_cache and temperature < 0.1:
+            for i, prompt in enumerate(prompts):
+                cache_key = self._get_cache_key(role, prompt, max_tokens, temperature, None)
+                if cache_key in self.response_cache:
+                    results[i] = self.response_cache[cache_key]
+                else:
+                    prompts_to_generate.append(prompt)
+                    indices_to_generate.append(i)
+        else:
+            prompts_to_generate = prompts
+            indices_to_generate = list(range(len(prompts)))
+        
+        # If all results are in cache, return them
+        if not prompts_to_generate:
+            return results
+        
+        # Ensure model is loaded
+        if role not in self.loaded_models:
+            if not self.load_model(role):
+                error_msg = f"Failed to load model for role: {role}"
+                logger.error(error_msg)
+                return [error_msg] * len(prompts_to_generate)
+                
+        model_data = self.loaded_models[role]
+        model = model_data["model"]
+        tokenizer = model_data["tokenizer"]
+        
+        # Process in optimal batch sizes
+        for batch_start in range(0, len(prompts_to_generate), batch_size):
+            batch_end = min(batch_start + batch_size, len(prompts_to_generate))
+            batch_prompts = prompts_to_generate[batch_start:batch_end]
+            batch_indices = indices_to_generate[batch_start:batch_end]
+            
+            try:
+                # Get modules
+                torch = self.lazy_importer.get_module("torch")
+                
+                # Tokenize batch with padding
+                batch_inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True)
+                
+                # Move to device
+                if self.device != "cpu":
+                    batch_inputs = {k: v.to(self.device) for k, v in batch_inputs.items()}
+                
+                # Create generation config
+                generation_config = {
+                    "max_length": max_tokens + batch_inputs["input_ids"].size(1),
+                    "do_sample": temperature > 0,
+                    "temperature": max(0.01, temperature),
+                    "num_return_sequences": 1,
+                    "pad_token_id": tokenizer.eos_token_id,
+                }
+                
+                # Add stopping criteria if available
+                stopping_criteria = self._get_stopping_criteria(tokenizer, stop_sequences, batch_inputs["input_ids"].size(1))
+                if stopping_criteria:
+                    generation_config["stopping_criteria"] = stopping_criteria
+                
+                # Add top_k and top_p if temperature is high enough
+                if temperature > 0.1:
+                    generation_config["top_k"] = 50
+                    generation_config["top_p"] = 0.95
+                
+                # Generate outputs
+                with torch.no_grad():
+                    output_ids = model.generate(
+                        **batch_inputs,
+                        **generation_config
+                    )
+                
+                # Process and store results
+                for i, output_id in enumerate(output_ids):
+                    input_length = batch_inputs["input_ids"].size(1)
+                    # Handle possible padding differences
+                    if i < len(batch_inputs["input_ids"]):
+                        # Find the actual input length for this particular item
+                        actual_input_length = torch.sum(batch_inputs["attention_mask"][i]).item()
+                        generated_text = tokenizer.decode(
+                            output_id[actual_input_length:], 
+                            skip_special_tokens=True
+                        )
+                    else:
+                        # Fallback if indices don't match
+                        generated_text = tokenizer.decode(
+                            output_id[input_length:], 
+                            skip_special_tokens=True
+                        )
+                    
+                    # Apply manual stopping if needed
+                    if stop_sequences and not stopping_criteria:
+                        for stop_seq in stop_sequences:
+                            if stop_seq in generated_text:
+                                generated_text = generated_text[:generated_text.find(stop_seq)]
+                    
+                    # Store result
+                    orig_index = batch_indices[i]
+                    results[orig_index] = generated_text
+                    
+                    # Cache if needed
+                    if use_cache and temperature < 0.1:
+                        prompt = prompts[orig_index]
+                        cache_key = self._get_cache_key(role, prompt, max_tokens, temperature, None)
+                        self.response_cache[cache_key] = generated_text
+                
+                # Maintain cache size
+                if use_cache and len(self.response_cache) > self.cache_size_limit:
+                    # Remove excess keys
+                    excess = len(self.response_cache) - self.cache_size_limit
+                    for _ in range(excess):
+                        if self.response_cache:
+                            oldest_key = next(iter(self.response_cache))
+                            del self.response_cache[oldest_key]
+                
+            except Exception as e:
+                error_msg = f"Error in batch generation: {str(e)}"
+                logger.error(error_msg)
+                
+                # Fill missing results with error message
+                for i in batch_indices:
+                    if results[i] is None:
+                        results[i] = error_msg
+        
+        return results
             
     def _get_stopping_criteria(self, tokenizer, stop_sequences, input_length):
         """
