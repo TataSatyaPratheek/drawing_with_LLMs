@@ -1,6 +1,18 @@
+# Core dependencies
 spacy>=3.5.0
 nltk>=3.8.1
 matplotlib>=3.7.0
 seaborn>=0.12.0
 typing-extensions>=4.4.0
 cairosvg>=2.5.2
+python-Levenshtein>=0.21.0
+
+# LLM dependencies
+torch>=2.0.0
+transformers>=4.30.0
+accelerate>=0.21.0
+bitsandbytes>=0.40.0  # For quantization support
+sentencepiece>=0.1.99  # Required for Mistral tokenizer
+
+# CLIP evaluation
+pillow>=9.3.0

@@ -1,0 +1,29 @@
+{
+    "llm": {
+      "prompt_analyzer_model": "mistralai/Mistral-7B-Instruct-v0.2",
+      "svg_generator_model": "deepseek-ai/deepseek-coder-6.7b-instruct",
+      "device": "auto",
+      "use_8bit": true,
+      "use_4bit": false,
+      "cache_dir": ".cache/models"
+    },
+    "clip": {
+      "model_name": "SigLIP-SoViT-400m",
+      "device": "auto",
+      "cache_dir": ".cache/clip"
+    },
+    "optimization": {
+      "max_iterations": [1, 2, 3],
+      "population_size": [3, 5, 8],
+      "exploration_rate": 0.3,
+      "hall_of_fame_dir": "hall_of_fame"
+    },
+    "fallback": {
+      "analyzer_threshold": 0.7,
+      "generator_threshold": 0.6
+    },
+    "system": {
+      "memory_efficient": true,
+      "max_svg_size": 9500
+    }
+  }
