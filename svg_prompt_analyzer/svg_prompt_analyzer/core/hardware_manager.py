@@ -2,7 +2,7 @@
 Hardware-Adaptive Model Manager
 =============================
 This module provides hardware-specific optimizations for LLM models,
-dynamically adapting to available computation resources.
+dynamically adapting to available computation resources for optimal performance.
 """
 
 import os
@@ -12,22 +12,25 @@ import platform
 import threading
 import json
 import time
+from pathlib import Path
 from typing import Dict, Any, Optional, List, Union, Tuple
 
-# Try to import optional dependencies
+logger = logging.getLogger(__name__)
+
+# Try to import optional dependencies with zero overhead if not available
 try:
     import torch
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+    logger.debug("PyTorch not available, hardware optimization will be limited")
 
 try:
     import psutil
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
-
-logger = logging.getLogger(__name__)
+    logger.debug("psutil not available, hardware detection will be limited")
 
 
 class HardwareManager:
@@ -44,6 +47,7 @@ class HardwareManager:
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super(HardwareManager, cls).__new__(cls)
+                cls._instance._initialized = False
             return cls._instance
     
     def __init__(self, 
@@ -53,7 +57,8 @@ class HardwareManager:
                  enable_mkldnn: bool = True,
                  enable_metal: bool = True,
                  enable_tensorrt: bool = True,
-                 enable_cuda_graphs: bool = True):
+                 enable_cuda_graphs: bool = True,
+                 config: Optional[Dict[str, Any]] = None):
         """
         Initialize the hardware manager.
         
@@ -65,10 +70,22 @@ class HardwareManager:
             enable_metal: Whether to enable Metal on macOS
             enable_tensorrt: Whether to enable TensorRT on NVIDIA
             enable_cuda_graphs: Whether to enable CUDA Graphs for inference
+            config: Optional configuration dictionary to override defaults
         """
         # Initialize only once (singleton pattern)
-        if hasattr(self, 'initialized'):
+        if self._initialized:
             return
+
+        # Apply configuration overrides if provided
+        if config:
+            llm_config = config.get("llm", {}).get("performance", {})
+            auto_optimize = llm_config.get("auto_optimize", auto_optimize)
+            quantization_threshold_memory = llm_config.get("quantization_threshold_memory", quantization_threshold_memory)
+            max_cpu_threads = llm_config.get("max_cpu_threads", max_cpu_threads)
+            enable_mkldnn = llm_config.get("enable_mkldnn", enable_mkldnn)
+            enable_metal = llm_config.get("enable_metal", enable_metal)
+            enable_tensorrt = llm_config.get("enable_tensorrt", enable_tensorrt)
+            enable_cuda_graphs = llm_config.get("enable_cuda_graphs", enable_cuda_graphs)
             
         self.auto_optimize = auto_optimize
         self.quantization_threshold_memory = quantization_threshold_memory
@@ -126,7 +143,7 @@ class HardwareManager:
             self._apply_hardware_optimizations()
         
         # Flag initialization complete
-        self.initialized = True
+        self._initialized = True
         logger.info(f"Hardware Manager initialized for {self.get_optimal_device()}")
         
     def _detect_hardware(self) -> Dict[str, Any]:
@@ -165,14 +182,21 @@ class HardwareManager:
         # Get CPU info
         try:
             if PSUTIL_AVAILABLE:
+                physical_cores = psutil.cpu_count(logical=False) or 1
+                logical_cores = psutil.cpu_count(logical=True) or 1
+                freq_mhz = None
+                
+                if hasattr(psutil, 'cpu_freq') and psutil.cpu_freq():
+                    freq_mhz = psutil.cpu_freq().current
+                
                 info["cpu_info"] = {
-                    "physical_cores": psutil.cpu_count(logical=False) or 1,
-                    "logical_cores": psutil.cpu_count(logical=True) or 1,
-                    "freq_mhz": psutil.cpu_freq().current if psutil.cpu_freq() else "Unknown"
+                    "physical_cores": physical_cores,
+                    "logical_cores": logical_cores,
+                    "freq_mhz": freq_mhz
                 }
                 
                 # Check for low-power device
-                if info["cpu_info"]["physical_cores"] <= 2:
+                if physical_cores <= 2:
                     info["low_memory_device"] = True  # Likely a constrained device
         except Exception as e:
             logger.warning(f"Error getting CPU info: {e}")
@@ -344,7 +368,10 @@ class HardwareManager:
                     logger.info("Enabled TF32 precision for CUDA operations")
                     
             # Set device
-            torch.cuda.set_device(0)  # Use first GPU by default
+            try:
+                torch.cuda.set_device(0)  # Use first GPU by default
+            except Exception as e:
+                logger.warning(f"Failed to set CUDA device: {e}")
             
             # Enable CUDA graphs if available and requested
             if self.enable_cuda_graphs and hasattr(torch.cuda, 'graphs') and callable(getattr(torch.cuda, 'is_current_stream_capturing', None)):
@@ -499,8 +526,6 @@ class HardwareManager:
         if device == "cuda":
             optimized_config["cuda_graphs"] = self.enable_cuda_graphs
             
-        # Model-specific optimizations (could be expanded based on model type)
-        
         logger.info(f"Optimized model config for {device}: {optimization_level['description']}")
         return optimized_config
     

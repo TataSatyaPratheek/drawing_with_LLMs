@@ -3,7 +3,7 @@ Enhanced Memory Manager
 ====================
 This module provides advanced memory management capabilities for the SVG Prompt Analyzer.
 It implements adaptive memory tracking, intelligent garbage collection, and hardware-aware
-resource allocation.
+resource allocation with minimal overhead.
 """
 
 import os
@@ -13,12 +13,19 @@ import time
 import logging
 import threading
 import weakref
-import psutil
+import multiprocessing
 from typing import Dict, Any, Optional, List, Union, Callable, Set, Tuple
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
-# Try to import optional dependencies
+# Try to import optional dependencies with zero overhead if not available
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
 try:
     import torch
     TORCH_AVAILABLE = True
@@ -52,6 +59,7 @@ class MemoryManager:
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super(MemoryManager, cls).__new__(cls)
+                cls._instance._initialized = False
             return cls._instance
     
     def __init__(self, 
@@ -59,10 +67,11 @@ class MemoryManager:
                  gc_collect_frequency: int = 5,
                  cuda_empty_frequency: int = 3,
                  memory_warning_threshold: float = 0.9,
-                 enable_tracemalloc: bool = True,
+                 enable_tracemalloc: bool = False,
                  check_interval: int = 5,
                  adaptive_batch_sizing: bool = True,
-                 log_level: str = "INFO"):
+                 log_level: str = "INFO",
+                 config: Optional[Dict[str, Any]] = None):
         """
         Initialize the memory manager.
         
@@ -75,10 +84,22 @@ class MemoryManager:
             check_interval: Seconds between memory checks
             adaptive_batch_sizing: Whether to adapt batch sizes to available memory
             log_level: Logging level for memory manager
+            config: Optional configuration dictionary to override defaults
         """
         # Initialize only once (singleton pattern)
-        if hasattr(self, 'initialized'):
+        if self._initialized:
             return
+            
+        # Apply configuration overrides if provided
+        if config:
+            memory_config = config.get("system", {}).get("memory_management", {})
+            gc_threshold = memory_config.get("gc_threshold", gc_threshold)
+            gc_collect_frequency = memory_config.get("gc_collect_frequency", gc_collect_frequency)
+            cuda_empty_frequency = memory_config.get("cuda_empty_cache_frequency", cuda_empty_frequency)
+            memory_warning_threshold = memory_config.get("memory_warning_threshold", memory_warning_threshold)
+            enable_tracemalloc = memory_config.get("enable_tracemalloc", enable_tracemalloc)
+            check_interval = memory_config.get("check_interval", check_interval)
+            adaptive_batch_sizing = memory_config.get("adaptive_batch_sizing", adaptive_batch_sizing)
             
         self.gc_threshold = gc_threshold
         self.gc_collect_frequency = gc_collect_frequency
@@ -122,7 +143,7 @@ class MemoryManager:
         self._log_hardware_info()
         
         # Flag initialization complete
-        self.initialized = True
+        self._initialized = True
         self.logger.info("Memory Manager initialized")
         
     def _detect_hardware(self) -> Dict[str, Any]:
@@ -135,8 +156,8 @@ class MemoryManager:
         info = {
             "platform": sys.platform,
             "processor_count": os.cpu_count() or 1,
-            "total_ram": psutil.virtual_memory().total,
-            "total_ram_gb": psutil.virtual_memory().total / (1024**3),
+            "total_ram": 0,
+            "total_ram_gb": 0,
             "has_cuda": False,
             "has_mps": False,
             "has_rocm": False,
@@ -144,10 +165,17 @@ class MemoryManager:
             "gpu_info": []
         }
         
+        # Get system memory
+        if PSUTIL_AVAILABLE:
+            try:
+                mem = psutil.virtual_memory()
+                info["total_ram"] = mem.total
+                info["total_ram_gb"] = mem.total / (1024**3)
+            except Exception:
+                pass
+        
         # Check for PyTorch and CUDA
         if TORCH_AVAILABLE:
-            import torch
-            
             # Check for CUDA (NVIDIA)
             if torch.cuda.is_available():
                 info["has_cuda"] = True
@@ -206,11 +234,11 @@ class MemoryManager:
         """Log detected hardware information."""
         self.logger.info(f"System: {self.hardware_info['platform']}, "
                         f"CPUs: {self.hardware_info['processor_count']}, "
-                        f"RAM: {self.hardware_info['total_ram_gb']:.2f} GB")
+                        f"RAM: {self.hardware_info.get('total_ram_gb', 0):.2f} GB")
                         
-        if self.hardware_info["has_gpu"]:
+        if self.hardware_info.get("has_gpu", False):
             gpu_info = []
-            for i, gpu in enumerate(self.hardware_info["gpu_info"]):
+            for i, gpu in enumerate(self.hardware_info.get("gpu_info", [])):
                 if "total_memory_gb" in gpu:
                     gpu_info.append(f"{gpu['name']} ({gpu['total_memory_gb']:.2f} GB)")
                 else:
@@ -218,11 +246,11 @@ class MemoryManager:
                     
             self.logger.info(f"GPUs: {', '.join(gpu_info)}")
             
-            if self.hardware_info["has_cuda"]:
-                self.logger.info(f"CUDA version: {self.hardware_info['cuda_version']}")
-            elif self.hardware_info["has_mps"]:
+            if self.hardware_info.get("has_cuda", False):
+                self.logger.info(f"CUDA version: {self.hardware_info.get('cuda_version', 'Unknown')}")
+            elif self.hardware_info.get("has_mps", False):
                 self.logger.info("Apple Silicon MPS available")
-            elif self.hardware_info["has_rocm"]:
+            elif self.hardware_info.get("has_rocm", False):
                 self.logger.info("AMD ROCm available")
         else:
             self.logger.info("No GPU acceleration available")
@@ -258,6 +286,10 @@ class MemoryManager:
         
     def _memory_monitor_loop(self) -> None:
         """Memory monitoring thread main loop."""
+        if not PSUTIL_AVAILABLE:
+            self.logger.warning("psutil not available, memory monitoring disabled")
+            return
+            
         process = psutil.Process(os.getpid())
         
         while self.monitor_running:
@@ -283,7 +315,7 @@ class MemoryManager:
                 if TORCH_AVAILABLE and torch.cuda.is_available():
                     for i in range(torch.cuda.device_count()):
                         allocated = torch.cuda.memory_allocated(i)
-                        total = torch.cuda.get_device_properties(i).total_memory if i < len(self.hardware_info["gpu_info"]) else 0
+                        total = torch.cuda.get_device_properties(i).total_memory
                         if total > 0:
                             gpu_percent = allocated / total
                             self.logger.debug(f"GPU {i} memory: {gpu_percent:.1%} ({allocated / 1024**3:.1f} GB)")
@@ -301,7 +333,8 @@ class MemoryManager:
                     if self.op_counter % 5 == 0:
                         top_stats = tracemalloc.take_snapshot().statistics('lineno')
                         for stat in top_stats[:3]:  # Show top 3 allocations
-                            self.logger.debug(f"Memory block: {stat.size / 1024:.1f} KB from {stat.traceback.format()[-1]}")
+                            trace = stat.traceback[0]
+                            self.logger.debug(f"Memory block: {stat.size / 1024:.1f} KB at {trace.filename}:{trace.lineno}")
                 
                 # Sleep for check interval
                 time.sleep(self.check_interval)
@@ -323,8 +356,7 @@ class MemoryManager:
             self.last_gc_collection = self.op_counter
         
         # Check if we should empty CUDA cache
-        if (TORCH_AVAILABLE and torch.cuda.is_available() and 
-            self.op_counter - self.last_cuda_emptied >= self.cuda_empty_frequency):
+        if TORCH_AVAILABLE and torch.cuda.is_available() and self.op_counter - self.last_cuda_emptied >= self.cuda_empty_frequency:
             self.empty_cuda_cache()
             self.last_cuda_emptied = self.op_counter
             
@@ -339,8 +371,10 @@ class MemoryManager:
         self.logger.debug("Forcing garbage collection")
         
         # Get memory before collection
-        process = psutil.Process(os.getpid())
-        mem_before = process.memory_info().rss
+        mem_before = 0
+        if PSUTIL_AVAILABLE:
+            process = psutil.Process(os.getpid())
+            mem_before = process.memory_info().rss
         
         # Run GC collection for all generations
         gc.collect(0)  # Young generation
@@ -348,8 +382,12 @@ class MemoryManager:
         gc.collect(2)  # Old generation (most thorough)
         
         # Get memory after collection
-        mem_after = process.memory_info().rss
-        mem_freed = mem_before - mem_after
+        mem_after = 0
+        mem_freed = 0
+        if PSUTIL_AVAILABLE:
+            process = psutil.Process(os.getpid())
+            mem_after = process.memory_info().rss
+            mem_freed = mem_before - mem_after
         
         # Get collection stats
         collection_time = time.time() - start_time
@@ -490,12 +528,16 @@ class MemoryManager:
             available_memory = free_memory * 0.75
         else:
             # CPU memory calculation
-            system_mem = psutil.virtual_memory()
-            process = psutil.Process(os.getpid())
-            process_mem = process.memory_info().rss
-            
-            # Calculate available memory (50% of available system memory)
-            available_memory = (system_mem.available * 0.5)
+            if PSUTIL_AVAILABLE:
+                system_mem = psutil.virtual_memory()
+                process = psutil.Process(os.getpid())
+                process_mem = process.memory_info().rss
+                
+                # Calculate available memory (50% of available system memory)
+                available_memory = (system_mem.available * 0.5)
+            else:
+                # Fallback when psutil is not available
+                available_memory = 4 * 1024 * 1024 * 1024  # Assume 4GB available
             
         # Calculate batch size
         # We need memory for: model + batch_size * item_size
@@ -518,7 +560,43 @@ class MemoryManager:
                        f"Model: {model_size_estimate / 1024**3:.2f} GB)")
                        
         return batch_size
+    
+    @contextmanager
+    def memory_tracking_context(self, context_name: str = "operation"):
+        """
+        Context manager for tracking memory usage of a code block.
         
+        Args:
+            context_name: Name for the operation being tracked
+        """
+        # Increment operation counter
+        self.operation_checkpoint()
+        
+        # Capture start memory
+        start_mem = self.get_current_memory_usage()
+        start_time = time.time()
+        
+        try:
+            # Execute the wrapped code
+            yield
+        except Exception as e:
+            # Force GC on error
+            self.logger.error(f"Error in {context_name}: {str(e)}")
+            self.force_garbage_collection()
+            raise
+        finally:
+            # Capture end memory and log difference
+            end_mem = self.get_current_memory_usage()
+            end_time = time.time()
+            
+            mem_diff = end_mem - start_mem
+            time_diff = end_time - start_time
+            
+            self.logger.debug(f"Memory {context_name}: {mem_diff/1024**2:.2f} MB change in {time_diff:.3f}s")
+            
+            # Clean up any temporary objects
+            self.operation_checkpoint()
+    
     def memory_efficient_function(self, func: Callable) -> Callable:
         """
         Decorator for memory-efficient functions.
@@ -549,6 +627,18 @@ class MemoryManager:
                 
         return wrapper
         
+    def get_current_memory_usage(self) -> int:
+        """
+        Get current memory usage in bytes.
+        
+        Returns:
+            Memory usage in bytes
+        """
+        if PSUTIL_AVAILABLE:
+            process = psutil.Process(os.getpid())
+            return process.memory_info().rss
+        return 0
+        
     def get_memory_stats(self) -> Dict[str, Any]:
         """
         Get comprehensive memory statistics.
@@ -565,22 +655,23 @@ class MemoryManager:
         }
         
         # System memory
-        sys_mem = psutil.virtual_memory()
-        stats["system"] = {
-            "total": sys_mem.total,
-            "available": sys_mem.available,
-            "used": sys_mem.used,
-            "percent": sys_mem.percent
-        }
-        
-        # Process memory
-        process = psutil.Process(os.getpid())
-        proc_mem = process.memory_info()
-        stats["process"] = {
-            "rss": proc_mem.rss,
-            "vms": proc_mem.vms,
-            "percent": proc_mem.rss / sys_mem.total * 100
-        }
+        if PSUTIL_AVAILABLE:
+            sys_mem = psutil.virtual_memory()
+            stats["system"] = {
+                "total": sys_mem.total,
+                "available": sys_mem.available,
+                "used": sys_mem.used,
+                "percent": sys_mem.percent
+            }
+            
+            # Process memory
+            process = psutil.Process(os.getpid())
+            proc_mem = process.memory_info()
+            stats["process"] = {
+                "rss": proc_mem.rss,
+                "vms": proc_mem.vms,
+                "percent": proc_mem.rss / sys_mem.total * 100
+            }
         
         # CUDA memory
         if TORCH_AVAILABLE and torch.cuda.is_available():
