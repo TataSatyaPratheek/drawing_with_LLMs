@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="800" height="600" viewBox="0 0 800 600"
+    xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+    <title>SVG illustration of purple pyramids spiraling around a bronze cone</title>
+    <desc>Generated from prompt: purple pyramids spiraling around a bronze cone</desc>
+    
+    <!-- Definitions for patterns, gradients, etc. -->
+    <defs>
+    </defs>
+    
+    <!-- Background -->
+    <rect width="100%" height="100%" fill="#F5F5F5" />
+
+    <!-- purple pyramids spiraling around a bronze cone_element -->
+    <rect x="410.00000000000006" y="276.0" width="60.0" height="48.0" fill="#808080" stroke="#000000" stroke-width="1" />
+
+    <!-- purple pyramids spiraling around a bronze cone_element -->
+    <rect x="392.95292807648025" y="315.99202887552764" width="65.45454545454545" height="52.36363636363637" fill="#808080" stroke="#000000" stroke-width="1" />
+
+    <!-- purple pyramids spiraling around a bronze cone_element -->
+    <rect x="309.7752840700307" y="319.0424733004035" width="70.90909090909092" height="56.72727272727274" fill="#808080" stroke="#000000" stroke-width="1" />
+
+    <!-- purple pyramids spiraling around a bronze cone_element -->
+    <rect x="260.6352864188348" y="247.1720614134506" width="76.36363636363637" height="61.0909090909091" fill="#808080" stroke="#000000" stroke-width="1" />
+
+    <!-- purple pyramids spiraling around a bronze cone_element -->
+    <rect x="340.97811149249094" y="172.78977145682006" width="81.81818181818183" height="65.45454545454547" fill="#808080" stroke="#000000" stroke-width="1" />
+
+    <!-- purple pyramids spiraling around a bronze cone_element -->
+    <rect x="481.786890349376" y="204.6374358663286" width="87.27272727272728" height="69.81818181818183" fill="#808080" stroke="#000000" stroke-width="1" />
+
+    <!-- purple pyramids spiraling around a bronze cone_element -->
+    <rect x="497.414240156602" y="332.2094138738538" width="92.72727272727272" height="74.18181818181817" fill="#808080" stroke="#000000" stroke-width="1" />
+
+    <!-- purple pyramids spiraling around a bronze cone_element -->
+    <rect x="323.4811402600578" y="403.8014629627894" width="98.18181818181819" height="78.54545454545456" fill="#808080" stroke="#000000" stroke-width="1" />
+
+    <!-- purple pyramids spiraling around a bronze cone_element -->
+    <rect x="142.32696202452604" y="303.8787841463028" width="103.63636363636364" height="82.90909090909092" fill="#808080" stroke="#000000" stroke-width="1" />
+
+    <!-- purple pyramids spiraling around a bronze cone_element -->
+    <rect x="190.66928106747824" y="122.38984818265408" width="109.09090909090911" height="87.2727272727273" fill="#808080" stroke="#000000" stroke-width="1" />
+
+    <!-- purple pyramids spiraling around a bronze cone_element -->
+    <rect x="449.979876084123" y="78.04398635407952" width="114.54545454545455" height="91.63636363636364" fill="#808080" stroke="#000000" stroke-width="1" />
+
+    <!-- purple pyramids spiraling around a bronze cone_element -->
+    <rect x="620.0" y="251.9999999999999" width="120.0" height="96.0" fill="#808080" stroke="#000000" stroke-width="1" />
+</svg>

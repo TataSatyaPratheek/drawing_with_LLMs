@@ -1,0 +1,2 @@
+svg_prompt_analyzer
+tests

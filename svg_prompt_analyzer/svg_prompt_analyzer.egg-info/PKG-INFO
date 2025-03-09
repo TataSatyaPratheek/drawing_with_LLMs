@@ -1,0 +1,23 @@
+Metadata-Version: 2.2
+Name: svg_prompt_analyzer
+Version: 0.1.0
+Summary: A tool to analyze text prompts and generate SVG images
+Author: Claude
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Requires-Python: >=3.8
+Requires-Dist: spacy>=3.5.0
+Requires-Dist: nltk>=3.8.1
+Requires-Dist: matplotlib>=3.7.0
+Requires-Dist: seaborn>=0.12.0
+Requires-Dist: typing-extensions>=4.4.0
+Requires-Dist: cairosvg>=2.5.2
+Dynamic: author
+Dynamic: classifier
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

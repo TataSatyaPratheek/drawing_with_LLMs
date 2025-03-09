@@ -1,0 +1,2 @@
+[console_scripts]
+svg-analyzer = svg_prompt_analyzer.main:run_cli
