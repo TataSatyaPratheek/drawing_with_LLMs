@@ -9,7 +9,7 @@ import numpy as np
 from typing import Dict, Any, List, Tuple, Optional, Union, Callable
 
 # Import optimized core module components
-from core import CONFIG, memoize, jit, Profiler, get_thread_pool
+from svg_prompt_analyzer.core import CONFIG, memoize, jit, Profiler, get_thread_pool
 
 class ModelPruner:
     """

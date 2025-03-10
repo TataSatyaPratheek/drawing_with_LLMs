@@ -15,10 +15,10 @@ from enum import Enum, auto
 import xml.etree.ElementTree as ET
 
 # Import core optimizations
-from core import CONFIG, memoize, Profiler, get_thread_pool
-from utils.logger import get_logger
-from models.color import Color, ColorPalette
-from models.shape import (
+from svg_prompt_analyzer.core import CONFIG, memoize, Profiler, get_thread_pool
+from svg_prompt_analyzer.utils.logger import get_logger
+from svg_prompt_analyzer.models.color import Color, ColorPalette
+from svg_prompt_analyzer.models.shape import (
     Shape, Rect, Circle, Ellipse, Line, Group, Transform,
     ShapeType, ShapeError, BoundingBox, Point
 )

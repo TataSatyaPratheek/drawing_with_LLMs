@@ -11,6 +11,12 @@ import functools
 from typing import Dict, Any, List, Optional, Union, Callable
 import importlib.util
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from svg_prompt_analyzer.core.batch_processor import BatchProcessor
+from svg_prompt_analyzer.core.core_module_integration import CoreManager, get_core_manager
+from svg_prompt_analyzer.core.hardware_manager import HardwareManager
+from svg_prompt_analyzer.core.memory_manager import MemoryManager
+from svg_prompt_analyzer.core.resource_monitor import ResourceMonitor
+
 
 # Configure logging with reasonable defaults for production
 logging.basicConfig(
@@ -173,6 +179,12 @@ __all__ = [
     "jit",
     "Profiler",
     "lazy_import",
+    "BatchProcessor",
+    "CoreManager",
+    "get_core_manager",
+    "HardwareManager",
+    "MemoryManager",
+    "ResourceMonitor"
 ]
 
 # Initialization message with platform info

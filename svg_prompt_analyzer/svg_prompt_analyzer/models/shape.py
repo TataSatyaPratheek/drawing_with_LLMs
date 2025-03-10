@@ -13,9 +13,9 @@ import hashlib
 import threading
 
 # Import core optimizations
-from core import CONFIG, memoize, jit, Profiler
-from utils.logger import get_logger
-from models.color import Color
+from svg_prompt_analyzer.core import CONFIG, memoize, jit, Profiler
+from svg_prompt_analyzer.utils.logger import get_logger
+from svg_prompt_analyzer.models.color import Color
 
 # Configure logger
 logger = get_logger(__name__)

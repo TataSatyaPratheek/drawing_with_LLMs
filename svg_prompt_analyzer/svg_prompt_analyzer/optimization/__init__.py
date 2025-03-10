@@ -5,8 +5,11 @@ This package contains modules for optimizing model performance,
 memory usage, and inference speed.
 """
 
-from svg_prompt_analyzer.optimization.model_pruner import ModelPruner
+from svg_prompt_analyzer.optimization.model_prunning import (
+    ModelPruner, batch_process_tensors, transfer_weights
+)
+
 
 __all__ = [
-    "ModelPruner"
+    "ModelPruner", "batch_process_tensors", "transfer_weights"
 ]

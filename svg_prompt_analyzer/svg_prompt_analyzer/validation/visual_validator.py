@@ -17,8 +17,8 @@ import threading
 import hashlib
 
 # Import core optimizations
-from core import CONFIG, memoize, get_thread_pool, Profiler
-from utils.logger import get_logger, log_function_call
+from svg_prompt_analyzer.core import CONFIG, memoize, get_thread_pool, Profiler
+from svg_prompt_analyzer.utils.logger import get_logger, log_function_call
 
 # Configure logger
 logger = get_logger(__name__)

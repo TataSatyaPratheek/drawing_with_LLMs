@@ -35,7 +35,7 @@ hardware_manager = HardwareManager()
 resource_monitor = ResourceMonitor()
 
 
-class SVGPromptAnalyzerApp:
+class LLMEnhancedSVGApp:
     """
     LLM-enhanced SVG generation application with RL optimization support.
     """
