@@ -9,20 +9,17 @@ import time
 import json
 import hashlib
 import threading
-import asyncio
 import re
 import logging
-import numpy as np
-from typing import Dict, List, Tuple, Optional, Union, Any, Callable
 from enum import Enum, auto
 from dataclasses import dataclass, field
-import concurrent.futures
-import queue
+from typing import Dict, List, Tuple, Optional, Union, Any, Callable
 from io import BytesIO
 
 # Import core optimizations
-from core import CONFIG, memoize, Profiler, get_thread_pool
-from utils.logger import get_logger, log_function_call
+from svg_prompt_analyzer.core import CONFIG, memoize, jit, Profiler, get_thread_pool
+from svg_prompt_analyzer.core.memory_manager import MemoryManager
+from svg_prompt_analyzer.utils.logger import get_logger, log_function_call
 
 # Configure logger
 logger = get_logger(__name__)
@@ -31,7 +28,7 @@ logger = get_logger(__name__)
 ResponseType = Dict[str, Any]
 PromptType = Union[str, List[Dict[str, str]]]
 TokenCount = int
-MessageList = List[Dict[str, Any]]
+MessageList = List[Dict[str, str]]
 
 # Constants
 DEFAULT_TEMPERATURE = 0.7
@@ -47,10 +44,12 @@ CACHE_TTL = 3600 * 24  # 1 day in seconds
 class ModelType(Enum):
     """Types of supported language models."""
     MISTRAL_7B = auto()
+    MISTRAL_INSTRUCT = auto()
     LLAMA3_8B = auto()
+    LLAMA3_INSTRUCT = auto()
     CODELLAMA_7B = auto()
-    LLAVA_NEXT = auto()
-    COGVLM = auto()
+    CODELLAMA_INSTRUCT = auto()
+    STABLE_LM = auto()
     CUSTOM = auto()
 
 
@@ -75,30 +74,6 @@ class ModelConfig:
     
     # Optional model-specific parameters
     model_params: Dict[str, Any] = field(default_factory=dict)
-
-
-# Configuration for RL training
-@dataclass
-class RLConfig:
-    """Configuration for reinforcement learning."""
-    enabled: bool = False
-    reward_model_path: Optional[str] = None
-    learning_rate: float = 1e-5
-    batch_size: int = 4
-    ppo_epochs: int = 4
-    clip_epsilon: float = 0.2
-    value_coef: float = 0.5
-    entropy_coef: float = 0.01
-    max_grad_norm: float = 0.5
-    kl_penalty: float = 0.1
-    use_advantage_norm: bool = True
-    gamma: float = 0.99
-    lambda_gae: float = 0.95
-    
-    # Multi-objective optimization weights
-    clip_score_weight: float = 1.0
-    svg_size_weight: float = 0.1
-    render_time_weight: float = 0.1
 
 
 class ModelBackend(Enum):
@@ -213,7 +188,7 @@ class ModelRunner:
     def __init__(
         self,
         config: ModelConfig,
-        backend: ModelBackend = ModelBackend.ONNX
+        backend: ModelBackend = ModelBackend.LLAMACPP
     ):
         """
         Initialize model runner.
@@ -228,6 +203,7 @@ class ModelRunner:
         self._tokenizer = None
         self._initialized = False
         self._lock = threading.RLock()
+        self.memory_manager = MemoryManager()
     
     def _ensure_initialized(self) -> None:
         """
@@ -295,288 +271,11 @@ class ModelRunner:
                 self._initialized = False
 
 
-class OnnxModelRunner(ModelRunner):
-    """
-    ONNX model runner.
-    
-    Runs models using ONNX Runtime for efficiency.
-    """
-    
-    def __init__(self, config: ModelConfig):
-        """
-        Initialize ONNX model runner.
-        
-        Args:
-            config: Model configuration
-        """
-        super().__init__(config, ModelBackend.ONNX)
-        self._session_options = None
-        self._session = None
-    
-    def _ensure_initialized(self) -> None:
-        """Ensure ONNX model is initialized."""
-        if self._initialized:
-            return
-            
-        with self._lock:
-            if self._initialized:
-                return
-                
-            try:
-                import onnxruntime as ort
-                
-                # Configure session options
-                self._session_options = ort.SessionOptions()
-                self._session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                self._session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-                self._session_options.intra_op_num_threads = self.config.threads
-                
-                # Set up providers
-                providers = []
-                if self.config.device == "cuda" and "CUDAExecutionProvider" in ort.get_available_providers():
-                    provider_options = {
-                        "device_id": 0,
-                        "arena_extend_strategy": "kNextPowerOfTwo",
-                        "gpu_mem_limit": 2 * 1024 * 1024 * 1024,  # 2GB
-                        "cudnn_conv_algo_search": "EXHAUSTIVE",
-                        "do_copy_in_default_stream": True,
-                    }
-                    providers.append(("CUDAExecutionProvider", provider_options))
-                providers.append("CPUExecutionProvider")
-                
-                # Create session
-                self._session = ort.InferenceSession(
-                    self.config.model_path,
-                    sess_options=self._session_options,
-                    providers=providers
-                )
-                
-                # Initialize tokenizer
-                try:
-                    import sentencepiece as spm
-                    tokenizer_path = self.config.weights_path or os.path.join(
-                        os.path.dirname(self.config.model_path), "tokenizer.model"
-                    )
-                    self._tokenizer = spm.SentencePieceProcessor(model_file=tokenizer_path)
-                except ImportError:
-                    logger.warning("SentencePiece not available, using custom tokenizer")
-                    # Implement a simple fallback tokenizer
-                    self._tokenizer = self._create_simple_tokenizer()
-                except Exception as e:
-                    logger.error(f"Failed to load tokenizer: {e}")
-                    self._tokenizer = self._create_simple_tokenizer()
-                
-                self._initialized = True
-                logger.info(f"Initialized ONNX model: {self.config.model_path}")
-                
-            except Exception as e:
-                logger.error(f"Failed to initialize ONNX model: {e}")
-                raise
-    
-    def generate(
-        self,
-        prompt: PromptType,
-        max_tokens: Optional[int] = None,
-        temperature: float = DEFAULT_TEMPERATURE,
-        top_p: float = 0.9,
-        top_k: int = 40,
-        stop_sequences: Optional[List[str]] = None,
-        **kwargs
-    ) -> Tuple[str, Dict[str, Any]]:
-        """
-        Generate completion using ONNX model.
-        
-        Args:
-            prompt: Text prompt or message list
-            max_tokens: Maximum tokens to generate
-            temperature: Temperature for sampling
-            top_p: Top-p sampling parameter
-            top_k: Top-k sampling parameter
-            stop_sequences: Sequences to stop generation
-            **kwargs: Additional parameters
-            
-        Returns:
-            Tuple of (generated_text, generation_info)
-        """
-        self._ensure_initialized()
-        
-        # Process prompt
-        if isinstance(prompt, list):
-            # Convert message list to string
-            prompt_text = self._convert_messages_to_text(prompt)
-        else:
-            prompt_text = prompt
-            
-        # Use default max tokens if not specified
-        max_tokens = max_tokens or self.config.max_tokens
-        
-        # Tokenize input
-        input_ids = self._tokenize(prompt_text)
-        
-        # Prepare input for model
-        model_inputs = {
-            "input_ids": np.array([input_ids], dtype=np.int64),
-            "max_length": np.array([len(input_ids) + max_tokens], dtype=np.int64),
-            "temperature": np.array([temperature], dtype=np.float32),
-            "top_p": np.array([top_p], dtype=np.float32),
-            "top_k": np.array([top_k], dtype=np.int32),
-        }
-        
-        # Run inference
-        with Profiler("onnx_inference"):
-            outputs = self._session.run(None, model_inputs)
-            
-        # Process output
-        output_ids = outputs[0][0][len(input_ids):]
-        generated_text = self._detokenize(output_ids)
-        
-        # Apply stop sequences
-        if stop_sequences:
-            for stop_seq in stop_sequences:
-                if stop_seq in generated_text:
-                    generated_text = generated_text[:generated_text.find(stop_seq)]
-                    
-        # Calculate simple token counts
-        generation_info = {
-            "prompt_tokens": len(input_ids),
-            "completion_tokens": len(output_ids),
-            "total_tokens": len(input_ids) + len(output_ids),
-        }
-        
-        return generated_text, generation_info
-    
-    def get_logprobs(
-        self,
-        prompt: PromptType,
-        response: str
-    ) -> List[float]:
-        """
-        Get log probabilities for tokens in the response.
-        
-        Args:
-            prompt: Text prompt or message list
-            response: Response text
-            
-        Returns:
-            List of log probabilities for each token
-        """
-        self._ensure_initialized()
-        
-        # Process prompt
-        if isinstance(prompt, list):
-            prompt_text = self._convert_messages_to_text(prompt)
-        else:
-            prompt_text = prompt
-            
-        # Tokenize input and response
-        prompt_ids = self._tokenize(prompt_text)
-        response_ids = self._tokenize(response)
-        
-        # Combine for context
-        input_ids = prompt_ids + response_ids
-        
-        # Get logits for each position
-        logprobs = []
-        
-        # This is a simplified approach - in practice, you'd run the model in a way
-        # that returns logits for each token and compute proper log probabilities
-        # For now, return placeholder values
-        logprobs = [-1.0] * len(response_ids)
-        
-        return logprobs
-    
-    def _tokenize(self, text: str) -> List[int]:
-        """
-        Tokenize text.
-        
-        Args:
-            text: Text to tokenize
-            
-        Returns:
-            List of token IDs
-        """
-        if hasattr(self._tokenizer, "encode"):
-            return self._tokenizer.encode(text)
-        elif hasattr(self._tokenizer, "EncodeAsIds"):
-            return self._tokenizer.EncodeAsIds(text)
-        else:
-            # Fallback for custom tokenizer
-            return self._tokenizer.tokenize(text)
-    
-    def _detokenize(self, token_ids: List[int]) -> str:
-        """
-        Detokenize token IDs.
-        
-        Args:
-            token_ids: List of token IDs
-            
-        Returns:
-            Detokenized text
-        """
-        if hasattr(self._tokenizer, "decode"):
-            return self._tokenizer.decode(token_ids)
-        elif hasattr(self._tokenizer, "DecodeIds"):
-            return self._tokenizer.DecodeIds(token_ids)
-        else:
-            # Fallback for custom tokenizer
-            return self._tokenizer.detokenize(token_ids)
-    
-    def _convert_messages_to_text(self, messages: List[Dict[str, str]]) -> str:
-        """
-        Convert message list to text.
-        
-        Args:
-            messages: List of message dictionaries
-            
-        Returns:
-            Formatted text
-        """
-        # Simple format: "role: content"
-        formatted = []
-        
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            
-            # Handle content as list (for multi-modal)
-            if isinstance(content, list):
-                parts = []
-                for part in content:
-                    if isinstance(part, dict):
-                        if part.get("type") == "text":
-                            parts.append(part.get("text", ""))
-                    else:
-                        parts.append(str(part))
-                content = " ".join(parts)
-                
-            formatted.append(f"{role}: {content}")
-            
-        return "\n".join(formatted)
-    
-    def _create_simple_tokenizer(self):
-        """
-        Create a simple fallback tokenizer.
-        
-        Returns:
-            Simple tokenizer object
-        """
-        class SimpleTokenizer:
-            def tokenize(self, text):
-                # Very simple character-level tokenization
-                return [ord(c) for c in text]
-                
-            def detokenize(self, tokens):
-                # Convert back to characters
-                return "".join([chr(t) for t in tokens])
-                
-        return SimpleTokenizer()
-
-
 class LLaMACppRunner(ModelRunner):
     """
     LLaMA.cpp model runner.
     
-    Runs models using llama.cpp for efficiency on CPU.
+    Runs models using llama.cpp for efficiency.
     """
     
     def __init__(self, config: ModelConfig):
@@ -588,6 +287,7 @@ class LLaMACppRunner(ModelRunner):
         """
         super().__init__(config, ModelBackend.LLAMACPP)
     
+    @log_function_call(level=logging.DEBUG)
     def _ensure_initialized(self) -> None:
         """Ensure LLaMA.cpp model is initialized."""
         if self._initialized:
@@ -598,39 +298,50 @@ class LLaMACppRunner(ModelRunner):
                 return
                 
             try:
-                # Try to import llama_cpp
-                from llama_cpp import Llama
-                
-                # Set up parameters
-                params = {
-                    "model_path": self.config.model_path,
-                    "n_ctx": self.config.token_limit,
-                    "n_threads": self.config.threads,
-                    "n_batch": self.config.batch_size,
-                }
-                
-                # Add quantization if specified
-                if self.config.quantization:
-                    if self.config.quantization == "int4":
-                        params["n_gpu_layers"] = 0  # Force CPU for int4
-                        params["use_mlock"] = True
-                        params["use_mmap"] = True
-                    elif self.config.quantization == "int8":
-                        params["n_gpu_layers"] = -1  # Use GPU if available
-                        
-                # Create model
-                self._model = Llama(**params)
-                
-                # No separate tokenizer needed for llama_cpp
-                self._tokenizer = None
-                
-                self._initialized = True
-                logger.info(f"Initialized LLaMA.cpp model: {self.config.model_path}")
+                with Profiler("model_initialization"):
+                    # Try to import llama_cpp
+                    try:
+                        from llama_cpp import Llama
+                    except ImportError:
+                        logger.error("Failed to import llama_cpp. Make sure it's installed.")
+                        raise
+                    
+                    # Set up parameters
+                    params = {
+                        "model_path": self.config.model_path,
+                        "n_ctx": self.config.token_limit,
+                        "n_threads": self.config.threads,
+                        "n_batch": self.config.batch_size,
+                    }
+                    
+                    # Add quantization if specified
+                    if self.config.quantization:
+                        if self.config.quantization == "int4":
+                            params["n_gpu_layers"] = 0  # Force CPU for int4
+                            params["use_mlock"] = True
+                            params["use_mmap"] = True
+                        elif self.config.quantization == "int8":
+                            params["n_gpu_layers"] = -1  # Use GPU if available
+                        else:
+                            # Default to int8 for other specified quantizations
+                            params["n_gpu_layers"] = -1
+                            
+                    # Create model
+                    logger.info(f"Loading model: {self.config.model_path} with parameters: {params}")
+                    self._model = Llama(**params)
+                    
+                    # No separate tokenizer needed for llama_cpp
+                    self._tokenizer = None
+                    
+                    self._initialized = True
+                    logger.info(f"Initialized LLaMA.cpp model: {self.config.model_path}")
                 
             except Exception as e:
-                logger.error(f"Failed to initialize LLaMA.cpp model: {e}")
+                logger.error(f"Failed to initialize LLaMA.cpp model: {str(e)}")
                 raise
     
+    @log_function_call(level=logging.DEBUG)
+    @memoize
     def generate(
         self,
         prompt: PromptType,
@@ -660,8 +371,8 @@ class LLaMACppRunner(ModelRunner):
         
         # Process prompt
         if isinstance(prompt, list):
-            # Convert message list to text for LLaMA.cpp
-            prompt_text = self._convert_messages_to_text(prompt)
+            # Process messages for chat format
+            prompt_text = self._format_chat_messages(prompt)
         else:
             prompt_text = prompt
             
@@ -671,29 +382,45 @@ class LLaMACppRunner(ModelRunner):
         # Prepare stop sequences
         stop = stop_sequences or []
         
-        # Run generation
-        with Profiler("llamacpp_inference"):
-            output = self._model.generate(
-                prompt_text,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                stop=stop,
-                **kwargs
-            )
-            
-        # Extract generated text
-        generated_text = output["choices"][0]["text"]
-        
-        # Get token counts
-        generation_info = {
-            "prompt_tokens": output.get("usage", {}).get("prompt_tokens", 0),
-            "completion_tokens": output.get("usage", {}).get("completion_tokens", 0),
-            "total_tokens": output.get("usage", {}).get("total_tokens", 0),
-        }
-        
-        return generated_text, generation_info
+        try:
+            # Run generation with memory profiling
+            with Profiler("llamacpp_inference"), self.memory_manager.memory_tracking_context("llm_generation"):
+                # Track token counts
+                prompt_tokens = len(self._model.tokenize(prompt_text))
+                
+                # Set generation parameters
+                generation_params = {
+                    "prompt": prompt_text,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "top_k": top_k,
+                    "stop": stop,
+                    **kwargs
+                }
+                
+                # Generate completion
+                output = self._model.generate(**generation_params)
+                
+                # Extract results
+                generated_text = output["choices"][0]["text"] if "choices" in output else output
+                
+                # Calculate token usage
+                completion_tokens = len(self._model.tokenize(generated_text))
+                
+                # Create generation info
+                generation_info = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                }
+                
+                return generated_text, generation_info
+                
+        except Exception as e:
+            logger.error(f"Error during generation: {str(e)}")
+            # Return empty result on error
+            return "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "error": str(e)}
     
     def get_logprobs(
         self,
@@ -714,70 +441,166 @@ class LLaMACppRunner(ModelRunner):
         
         # Process prompt
         if isinstance(prompt, list):
-            prompt_text = self._convert_messages_to_text(prompt)
+            prompt_text = self._format_chat_messages(prompt)
         else:
             prompt_text = prompt
             
         # Full text for context
         full_text = prompt_text + response
         
-        # Get log probs from LLaMA.cpp
-        # Note: This assumes a modified version of llama_cpp with logit output
-        output = self._model.generate(
-            prompt_text,
-            max_tokens=0,  # Don't generate additional tokens
-            logprobs=True,
-            echo=True
-        )
-        
-        # Extract logprobs for response tokens
-        logprobs = []
-        
-        # In practice, you would need to extract the token indices corresponding
-        # to the response and get their logprobs
-        # This is a placeholder implementation
-        logprobs = [-1.0] * len(self._model.tokenize(response))
-        
-        return logprobs
+        try:
+            # Get logprobs from LLaMA.cpp
+            # Note: This is a simplified approach for models that may not directly expose logprobs
+            # In a production environment, you would use a model API that provides this functionality
+            
+            # Tokenize the response to count tokens
+            response_tokens = self._model.tokenize(response)
+            
+            # Create placeholder log probabilities
+            # Ideally, this would use actual token logprobs from the model
+            logprobs = [-1.0] * len(response_tokens)
+            
+            return logprobs
+            
+        except Exception as e:
+            logger.error(f"Error getting logprobs: {str(e)}")
+            # Return placeholder on error
+            return [-1.0] * 10  # Arbitrary length
     
-    def _convert_messages_to_text(self, messages: List[Dict[str, str]]) -> str:
+    def _format_chat_messages(self, messages: List[Dict[str, str]]) -> str:
         """
-        Convert message list to text format for LLaMA models.
+        Format chat messages for model input.
         
         Args:
             messages: List of message dictionaries
             
         Returns:
-            Formatted text
+            Formatted text for model input
         """
-        # LLaMA chat format
+        # Different formatting based on model type
+        if self.config.model_type in [ModelType.MISTRAL_INSTRUCT, ModelType.MISTRAL_7B]:
+            return self._format_mistral_chat(messages)
+        elif self.config.model_type in [ModelType.LLAMA3_INSTRUCT, ModelType.LLAMA3_8B]:
+            return self._format_llama_chat(messages)
+        elif self.config.model_type in [ModelType.CODELLAMA_INSTRUCT, ModelType.CODELLAMA_7B]:
+            return self._format_codellama_chat(messages)
+        else:
+            # Default format
+            return self._format_default_chat(messages)
+    
+    def _format_mistral_chat(self, messages: List[Dict[str, str]]) -> str:
+        """Format messages for Mistral models."""
+        formatted = []
+        
+        for msg in messages:
+            role = msg.get("role", "user").lower()
+            content = msg.get("content", "")
+            
+            # Process content if it's a list (for multi-modal)
+            if isinstance(content, list):
+                content = self._process_content_list(content)
+                
+            if role == "system":
+                formatted.append(f"<s>[INST] {content} [/INST]")
+            elif role == "user":
+                formatted.append(f"<s>[INST] {content} [/INST]")
+            elif role == "assistant":
+                formatted.append(f"{content} </s>")
+            else:
+                # Default to user for unknown roles
+                formatted.append(f"<s>[INST] {content} [/INST]")
+                
+        # Add final token for generation
+        if not formatted[-1].endswith("</s>"):
+            formatted.append("<s>[INST] ")
+            
+        return "".join(formatted)
+    
+    def _format_llama_chat(self, messages: List[Dict[str, str]]) -> str:
+        """Format messages for Llama models."""
+        formatted = []
+        
+        for msg in messages:
+            role = msg.get("role", "user").lower()
+            content = msg.get("content", "")
+            
+            # Process content if it's a list (for multi-modal)
+            if isinstance(content, list):
+                content = self._process_content_list(content)
+                
+            if role == "system":
+                formatted.append(f"<|system|>\n{content}\n</s>")
+            elif role == "user":
+                formatted.append(f"<|user|>\n{content}\n</s>")
+            elif role == "assistant":
+                formatted.append(f"<|assistant|>\n{content}\n</s>")
+            else:
+                # Default to user for unknown roles
+                formatted.append(f"<|user|>\n{content}\n</s>")
+                
+        # Add final token for generation
+        formatted.append("<|assistant|>\n")
+            
+        return "\n".join(formatted)
+    
+    def _format_codellama_chat(self, messages: List[Dict[str, str]]) -> str:
+        """Format messages for CodeLlama models."""
+        formatted = []
+        
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "user").lower()
+            content = msg.get("content", "")
+            
+            # Process content if it's a list (for multi-modal)
+            if isinstance(content, list):
+                content = self._process_content_list(content)
+                
+            if role == "system" and i == 0:
+                # System message as preamble
+                formatted.append(f"{content}\n")
+            elif role == "user":
+                formatted.append(f"Question: {content}")
+            elif role == "assistant":
+                formatted.append(f"Answer: {content}")
+            else:
+                # Default to user for unknown roles
+                formatted.append(f"Question: {content}")
+                
+        # Add final token for generation
+        if not formatted[-1].startswith("Answer:"):
+            formatted.append("Answer:")
+            
+        return "\n\n".join(formatted)
+    
+    def _format_default_chat(self, messages: List[Dict[str, str]]) -> str:
+        """Default message formatting for models without specific formats."""
         formatted = []
         
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             
-            # Handle content as list (for multi-modal)
+            # Process content if it's a list (for multi-modal)
             if isinstance(content, list):
-                parts = []
-                for part in content:
-                    if isinstance(part, dict):
-                        if part.get("type") == "text":
-                            parts.append(part.get("text", ""))
-                    else:
-                        parts.append(str(part))
-                content = " ".join(parts)
+                content = self._process_content_list(content)
                 
-            if role == "system":
-                formatted.append(f"<s>[SYSTEM] {content} </s>")
-            elif role == "user":
-                formatted.append(f"<s>[USER] {content} </s>")
-            elif role == "assistant":
-                formatted.append(f"<s>[ASSISTANT] {content} </s>")
-            else:
-                formatted.append(f"<s>[{role.upper()}] {content} </s>")
+            formatted.append(f"{role}: {content}")
+            
+        return "\n".join(formatted)
+    
+    def _process_content_list(self, content_list: List[Any]) -> str:
+        """Process a list of content items (for multi-modal support)."""
+        text_parts = []
+        
+        for item in content_list:
+            if isinstance(item, str):
+                text_parts.append(item)
+            elif isinstance(item, dict):
+                if item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+                # Other types (image, etc.) are ignored as we don't support them yet
                 
-        return "".join(formatted) + "<s>[ASSISTANT] "
+        return " ".join(text_parts)
 
 
 class CTModelRunner(ModelRunner):
@@ -795,7 +618,9 @@ class CTModelRunner(ModelRunner):
             config: Model configuration
         """
         super().__init__(config, ModelBackend.CTRANSFORMERS)
+        self.memory_manager = MemoryManager()
     
+    @log_function_call(level=logging.DEBUG)
     def _ensure_initialized(self) -> None:
         """Ensure CTransformers model is initialized."""
         if self._initialized:
@@ -806,35 +631,41 @@ class CTModelRunner(ModelRunner):
                 return
                 
             try:
-                # Try to import ctransformers
-                from ctransformers import AutoModelForCausalLM
-                
-                # Set up parameters
-                params = {
-                    "model_path": self.config.model_path,
-                    "model_type": self._get_model_type(),
-                    "context_length": self.config.token_limit,
-                    "threads": self.config.threads,
-                    "batch_size": self.config.batch_size,
-                }
-                
-                # Add GPU configuration
-                if self.config.device == "cuda":
-                    params["gpu_layers"] = 50  # Use most layers on GPU
-                else:
-                    params["gpu_layers"] = 0
+                with Profiler("model_initialization"):
+                    # Try to import ctransformers
+                    try:
+                        from ctransformers import AutoModelForCausalLM
+                    except ImportError:
+                        logger.error("Failed to import ctransformers. Make sure it's installed.")
+                        raise
                     
-                # Create model
-                self._model = AutoModelForCausalLM.from_pretrained(**params)
-                
-                # No separate tokenizer needed for ctransformers
-                self._tokenizer = None
-                
-                self._initialized = True
-                logger.info(f"Initialized CTransformers model: {self.config.model_path}")
+                    # Set up parameters
+                    params = {
+                        "model_path": self.config.model_path,
+                        "model_type": self._get_model_type(),
+                        "context_length": self.config.token_limit,
+                        "threads": self.config.threads,
+                        "batch_size": self.config.batch_size,
+                    }
+                    
+                    # Add GPU configuration
+                    if self.config.device == "cuda":
+                        params["gpu_layers"] = 50  # Use most layers on GPU
+                    else:
+                        params["gpu_layers"] = 0
+                        
+                    # Create model
+                    logger.info(f"Loading model: {self.config.model_path} with parameters: {params}")
+                    self._model = AutoModelForCausalLM.from_pretrained(**params)
+                    
+                    # No separate tokenizer needed for ctransformers
+                    self._tokenizer = None
+                    
+                    self._initialized = True
+                    logger.info(f"Initialized CTransformers model: {self.config.model_path}")
                 
             except Exception as e:
-                logger.error(f"Failed to initialize CTransformers model: {e}")
+                logger.error(f"Failed to initialize CTransformers model: {str(e)}")
                 raise
     
     def _get_model_type(self) -> str:
@@ -847,13 +678,19 @@ class CTModelRunner(ModelRunner):
         # Map model types to CTransformers model types
         model_type_map = {
             ModelType.MISTRAL_7B: "mistral",
+            ModelType.MISTRAL_INSTRUCT: "mistral",
             ModelType.LLAMA3_8B: "llama",
+            ModelType.LLAMA3_INSTRUCT: "llama",
             ModelType.CODELLAMA_7B: "llama",
+            ModelType.CODELLAMA_INSTRUCT: "llama",
+            ModelType.STABLE_LM: "stablelm",
             ModelType.CUSTOM: "llama",  # Default to llama
         }
         
         return model_type_map.get(self.config.model_type, "llama")
     
+    @log_function_call(level=logging.DEBUG)
+    @memoize
     def generate(
         self,
         prompt: PromptType,
@@ -883,50 +720,54 @@ class CTModelRunner(ModelRunner):
         
         # Process prompt
         if isinstance(prompt, list):
-            # Convert message list to text for CTransformers
-            prompt_text = self._convert_messages_to_text(prompt)
+            # Process messages for chat format
+            prompt_text = self._format_chat_messages(prompt)
         else:
             prompt_text = prompt
             
         # Use default max tokens if not specified
         max_tokens = max_tokens or self.config.max_tokens
         
-        # Set up generation parameters
-        params = {
-            "max_new_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-        }
-        
-        # Add stop sequences if provided
-        if stop_sequences:
-            params["stop"] = stop_sequences
-            
-        # Run generation
-        with Profiler("ctransformers_inference"):
-            # Get token count before generation
-            prompt_tokens = self._model.tokenize(prompt_text)
-            prompt_token_count = len(prompt_tokens)
-            
-            # Generate text
-            generated_text = self._model(
-                prompt_text,
-                **params
-            )
-            
-            # Get token count after generation
-            full_tokens = self._model.tokenize(prompt_text + generated_text)
-            completion_token_count = len(full_tokens) - prompt_token_count
-            
-        # Create generation info
-        generation_info = {
-            "prompt_tokens": prompt_token_count,
-            "completion_tokens": completion_token_count,
-            "total_tokens": prompt_token_count + completion_token_count,
-        }
-        
-        return generated_text, generation_info
+        try:
+            # Run generation with memory profiling
+            with Profiler("ctransformers_inference"), self.memory_manager.memory_tracking_context("llm_generation"):
+                # Track token counts
+                prompt_tokens = self._model.tokenize(prompt_text)
+                prompt_token_count = len(prompt_tokens)
+                
+                # Set up generation parameters
+                params = {
+                    "max_new_tokens": max_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "top_k": top_k,
+                    **kwargs
+                }
+                
+                # Add stop sequences if provided
+                if stop_sequences:
+                    params["stop"] = stop_sequences
+                    
+                # Generate text
+                generated_text = self._model(prompt_text, **params)
+                
+                # Get token count after generation
+                full_tokens = self._model.tokenize(prompt_text + generated_text)
+                completion_token_count = len(full_tokens) - prompt_token_count
+                
+                # Create generation info
+                generation_info = {
+                    "prompt_tokens": prompt_token_count,
+                    "completion_tokens": completion_token_count,
+                    "total_tokens": prompt_token_count + completion_token_count,
+                }
+                
+                return generated_text, generation_info
+                
+        except Exception as e:
+            logger.error(f"Error during generation: {str(e)}")
+            # Return empty result on error
+            return "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "error": str(e)}
     
     def get_logprobs(
         self,
@@ -943,443 +784,149 @@ class CTModelRunner(ModelRunner):
         Returns:
             List of log probabilities for each token
         """
-        # CTransformers doesn't provide direct logprob access
-        # This is a placeholder implementation
+        # CTransformers doesn't directly provide logprobs, so we return placeholders
         tokens = self._model.tokenize(response)
         return [-1.0] * len(tokens)
     
-    def _convert_messages_to_text(self, messages: List[Dict[str, str]]) -> str:
+    def _format_chat_messages(self, messages: List[Dict[str, str]]) -> str:
         """
-        Convert message list to text for CTransformers.
+        Format chat messages for model input.
         
         Args:
             messages: List of message dictionaries
             
         Returns:
-            Formatted text
+            Formatted text for model input
         """
-        # Similar to LLaMA chat format
+        # Different formatting based on model type
+        if self.config.model_type in [ModelType.MISTRAL_INSTRUCT, ModelType.MISTRAL_7B]:
+            return self._format_mistral_chat(messages)
+        elif self.config.model_type in [ModelType.LLAMA3_INSTRUCT, ModelType.LLAMA3_8B]:
+            return self._format_llama_chat(messages)
+        elif self.config.model_type in [ModelType.CODELLAMA_INSTRUCT, ModelType.CODELLAMA_7B]:
+            return self._format_codellama_chat(messages)
+        else:
+            # Default format
+            return self._format_default_chat(messages)
+    
+    def _format_mistral_chat(self, messages: List[Dict[str, str]]) -> str:
+        """Format messages for Mistral models."""
+        # Same implementation as in LLaMACppRunner
+        formatted = []
+        
+        for msg in messages:
+            role = msg.get("role", "user").lower()
+            content = msg.get("content", "")
+            
+            # Process content if it's a list (for multi-modal)
+            if isinstance(content, list):
+                content = self._process_content_list(content)
+                
+            if role == "system":
+                formatted.append(f"<s>[INST] {content} [/INST]")
+            elif role == "user":
+                formatted.append(f"<s>[INST] {content} [/INST]")
+            elif role == "assistant":
+                formatted.append(f"{content} </s>")
+            else:
+                # Default to user for unknown roles
+                formatted.append(f"<s>[INST] {content} [/INST]")
+                
+        # Add final token for generation
+        if not formatted[-1].endswith("</s>"):
+            formatted.append("<s>[INST] ")
+            
+        return "".join(formatted)
+    
+    def _format_llama_chat(self, messages: List[Dict[str, str]]) -> str:
+        """Format messages for Llama models."""
+        # Same implementation as in LLaMACppRunner
+        formatted = []
+        
+        for msg in messages:
+            role = msg.get("role", "user").lower()
+            content = msg.get("content", "")
+            
+            # Process content if it's a list (for multi-modal)
+            if isinstance(content, list):
+                content = self._process_content_list(content)
+                
+            if role == "system":
+                formatted.append(f"<|system|>\n{content}\n</s>")
+            elif role == "user":
+                formatted.append(f"<|user|>\n{content}\n</s>")
+            elif role == "assistant":
+                formatted.append(f"<|assistant|>\n{content}\n</s>")
+            else:
+                # Default to user for unknown roles
+                formatted.append(f"<|user|>\n{content}\n</s>")
+                
+        # Add final token for generation
+        formatted.append("<|assistant|>\n")
+            
+        return "\n".join(formatted)
+    
+    def _format_codellama_chat(self, messages: List[Dict[str, str]]) -> str:
+        """Format messages for CodeLlama models."""
+        # Same implementation as in LLaMACppRunner
+        formatted = []
+        
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "user").lower()
+            content = msg.get("content", "")
+            
+            # Process content if it's a list (for multi-modal)
+            if isinstance(content, list):
+                content = self._process_content_list(content)
+                
+            if role == "system" and i == 0:
+                # System message as preamble
+                formatted.append(f"{content}\n")
+            elif role == "user":
+                formatted.append(f"Question: {content}")
+            elif role == "assistant":
+                formatted.append(f"Answer: {content}")
+            else:
+                # Default to user for unknown roles
+                formatted.append(f"Question: {content}")
+                
+        # Add final token for generation
+        if not formatted[-1].startswith("Answer:"):
+            formatted.append("Answer:")
+            
+        return "\n\n".join(formatted)
+    
+    def _format_default_chat(self, messages: List[Dict[str, str]]) -> str:
+        """Default message formatting for models without specific formats."""
+        # Same implementation as in LLaMACppRunner
         formatted = []
         
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             
-            # Handle content as list (for multi-modal)
+            # Process content if it's a list (for multi-modal)
             if isinstance(content, list):
-                parts = []
-                for part in content:
-                    if isinstance(part, dict):
-                        if part.get("type") == "text":
-                            parts.append(part.get("text", ""))
-                    else:
-                        parts.append(str(part))
-                content = " ".join(parts)
+                content = self._process_content_list(content)
                 
-            if role == "system":
-                formatted.append(f"<s>[SYSTEM] {content} </s>")
-            elif role == "user":
-                formatted.append(f"<s>[USER] {content} </s>")
-            elif role == "assistant":
-                formatted.append(f"<s>[ASSISTANT] {content} </s>")
-            else:
-                formatted.append(f"<s>[{role.upper()}] {content} </s>")
-                
-        return "".join(formatted) + "<s>[ASSISTANT] "
-
-
-class RewardModel:
-    """
-    Reward model for reinforcement learning.
-    
-    Evaluates generated SVGs and provides rewards for RL training.
-    """
-    
-    def __init__(self, clip_model_path: Optional[str] = None):
-        """
-        Initialize reward model.
-        
-        Args:
-            clip_model_path: Path to CLIP model for similarity scoring
-        """
-        self.clip_model_path = clip_model_path
-        self._clip_model = None
-        self._initialized = False
-        self._lock = threading.RLock()
-    
-    def _ensure_initialized(self) -> None:
-        """Ensure reward model is initialized."""
-        if self._initialized:
-            return
+            formatted.append(f"{role}: {content}")
             
-        with self._lock:
-            if self._initialized:
-                return
-                
-            try:
-                # Try to initialize CLIP model for SVG evaluation
-                # This is a simplified version - in practice, you would
-                # load a proper CLIP model or other reward model
-                
-                # For now, just set a flag to indicate initialization
-                self._initialized = True
-                logger.info("Initialized reward model")
-                
-            except Exception as e:
-                logger.error(f"Failed to initialize reward model: {e}")
-                raise
+        return "\n".join(formatted)
     
-    def calculate_reward(
-        self,
-        prompt: PromptType,
-        svg_content: str,
-        **kwargs
-    ) -> float:
-        """
-        Calculate reward for generated SVG.
-        
-        Args:
-            prompt: Original prompt
-            svg_content: Generated SVG content
-            **kwargs: Additional parameters
-            
-        Returns:
-            Reward value
-        """
-        self._ensure_initialized()
-        
-        # Calculate various reward components
-        clip_score = self._calculate_clip_score(prompt, svg_content)
-        svg_size_score = self._calculate_svg_size_score(svg_content)
-        render_time_score = self._calculate_render_time_score(svg_content)
-        
-        # Combine reward components
-        weights = kwargs.get("weights", {})
-        clip_weight = weights.get("clip_score_weight", 1.0)
-        size_weight = weights.get("svg_size_weight", 0.1)
-        time_weight = weights.get("render_time_weight", 0.1)
-        
-        total_reward = (
-            clip_weight * clip_score +
-            size_weight * svg_size_score +
-            time_weight * render_time_score
-        )
-        
-        return total_reward
-    
-    def _calculate_clip_score(self, prompt: PromptType, svg_content: str) -> float:
-        """
-        Calculate CLIP similarity score.
-        
-        Args:
-            prompt: Text prompt
-            svg_content: SVG content
-            
-        Returns:
-            CLIP similarity score (0-1)
-        """
-        # In a real implementation, this would use CLIP to compare
-        # the SVG (rendered to an image) with the text prompt
-        
-        # For now, return a placeholder score
-        prompt_str = prompt if isinstance(prompt, str) else self._convert_messages_to_text(prompt)
-        
-        # Simple heuristic based on keyword matching
-        keywords = self._extract_keywords(prompt_str)
-        svg_text = self._extract_text_from_svg(svg_content)
-        
-        # Count matches
-        matches = sum(1 for kw in keywords if kw.lower() in svg_text.lower())
-        match_ratio = matches / max(1, len(keywords))
-        
-        # Scale to 0.4-0.9 range (avoid extremes for placeholder)
-        score = 0.4 + (0.5 * match_ratio)
-        
-        return score
-    
-    def _calculate_svg_size_score(self, svg_content: str) -> float:
-        """
-        Calculate score based on SVG file size.
-        
-        Args:
-            svg_content: SVG content
-            
-        Returns:
-            Size score (0-1)
-        """
-        # Measure SVG size in bytes
-        size_bytes = len(svg_content.encode('utf-8'))
-        
-        # Prefer reasonable sizes (not too small, not too large)
-        # Peak score at around 10KB
-        if size_bytes < 1000:
-            # Too small, might be too simple
-            return 0.4
-        elif size_bytes < 10000:
-            # Good range
-            return 0.8 * (size_bytes / 10000)
-        else:
-            # Larger sizes get diminishing returns
-            return 0.8 * (10000 / size_bytes)
-    
-    def _calculate_render_time_score(self, svg_content: str) -> float:
-        """
-        Estimate score based on SVG rendering complexity.
-        
-        Args:
-            svg_content: SVG content
-            
-        Returns:
-            Render time score (0-1)
-        """
-        # Count complex elements that might affect rendering
-        num_paths = svg_content.count("<path")
-        num_gradients = svg_content.count("<linearGradient") + svg_content.count("<radialGradient")
-        num_filters = svg_content.count("<filter")
-        
-        # Estimate complexity
-        complexity = 0.1 + (0.01 * num_paths) + (0.05 * num_gradients) + (0.1 * num_filters)
-        
-        # Penalize overly complex SVGs
-        if complexity > 1.0:
-            return 1.0 / complexity
-        else:
-            return 0.8 * complexity
-    
-    def _extract_keywords(self, text: str) -> List[str]:
-        """
-        Extract keywords from text.
-        
-        Args:
-            text: Text to extract keywords from
-            
-        Returns:
-            List of keywords
-        """
-        # Simple keyword extraction
-        words = re.findall(r'\b\w+\b', text.lower())
-        
-        # Remove common stop words
-        stop_words = {
-            "a", "an", "the", "and", "or", "but", "in", "on", "at", "with",
-            "for", "to", "from", "of", "by", "about", "like", "as", "is", "are"
-        }
-        
-        keywords = [word for word in words if word not in stop_words and len(word) > 2]
-        
-        return keywords
-    
-    def _extract_text_from_svg(self, svg_content: str) -> str:
-        """
-        Extract text content from SVG for keyword matching.
-        
-        Args:
-            svg_content: SVG content
-            
-        Returns:
-            Extracted text
-        """
-        # Extract text from various elements
-        elements = []
-        
-        # Extract from text elements
-        text_elements = re.findall(r'<text[^>]*>(.*?)</text>', svg_content, re.DOTALL)
-        elements.extend(text_elements)
-        
-        # Extract from title and desc
-        title_elements = re.findall(r'<title[^>]*>(.*?)</title>', svg_content, re.DOTALL)
-        desc_elements = re.findall(r'<desc[^>]*>(.*?)</desc>', svg_content, re.DOTALL)
-        elements.extend(title_elements)
-        elements.extend(desc_elements)
-        
-        # Extract from attributes
-        attr_text = []
-        attr_patterns = [
-            r'id="([^"]*)"',
-            r'class="([^"]*)"',
-            r'aria-label="([^"]*)"',
-        ]
-        
-        for pattern in attr_patterns:
-            matches = re.findall(pattern, svg_content)
-            attr_text.extend(matches)
-            
-        # Combine all text
-        all_text = " ".join(elements + attr_text)
-        
-        return all_text
-    
-    def _convert_messages_to_text(self, messages: List[Dict[str, str]]) -> str:
-        """
-        Convert message list to text.
-        
-        Args:
-            messages: List of message dictionaries
-            
-        Returns:
-            Combined text
-        """
+    def _process_content_list(self, content_list: List[Any]) -> str:
+        """Process a list of content items (for multi-modal support)."""
+        # Same implementation as in LLaMACppRunner
         text_parts = []
         
-        for msg in messages:
-            content = msg.get("content", "")
-            
-            # Handle content as list (for multi-modal)
-            if isinstance(content, list):
-                parts = []
-                for part in content:
-                    if isinstance(part, dict):
-                        if part.get("type") == "text":
-                            parts.append(part.get("text", ""))
-                    else:
-                        parts.append(str(part))
-                content = " ".join(parts)
+        for item in content_list:
+            if isinstance(item, str):
+                text_parts.append(item)
+            elif isinstance(item, dict):
+                if item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+                # Other types (image, etc.) are ignored as we don't support them yet
                 
-            text_parts.append(content)
-            
         return " ".join(text_parts)
-
-
-class PPOTrainer:
-    """
-    Proximal Policy Optimization (PPO) trainer for RL fine-tuning.
-    
-    Implements PPO algorithm for reinforcement learning with LLMs.
-    """
-    
-    def __init__(
-        self,
-        model_runner: ModelRunner,
-        reward_model: RewardModel,
-        config: RLConfig
-    ):
-        """
-        Initialize PPO trainer.
-        
-        Args:
-            model_runner: Model runner for policy model
-            reward_model: Reward model for evaluation
-            config: RL configuration
-        """
-        self.model_runner = model_runner
-        self.reward_model = reward_model
-        self.config = config
-        
-        # Training state
-        self.samples = []
-        self.iteration = 0
-        
-        # Simple stats tracking
-        self.stats = {
-            "mean_reward": 0.0,
-            "min_reward": 0.0,
-            "max_reward": 0.0,
-            "std_reward": 0.0,
-            "iterations": 0,
-            "samples_collected": 0,
-        }
-    
-    def collect_samples(
-        self,
-        prompts: List[PromptType],
-        num_samples_per_prompt: int = 4
-    ) -> List[GenerationSample]:
-        """
-        Collect samples for PPO training.
-        
-        Args:
-            prompts: List of prompts
-            num_samples_per_prompt: Number of samples per prompt
-            
-        Returns:
-            List of generation samples
-        """
-        samples = []
-        
-        # Generate samples for each prompt
-        for prompt in prompts:
-            for _ in range(num_samples_per_prompt):
-                # Generate SVG
-                response, _ = self.model_runner.generate(
-                    prompt,
-                    temperature=self.config.temperature if hasattr(self.config, "temperature") else 0.7,
-                    max_tokens=self.config.max_tokens if hasattr(self.config, "max_tokens") else 1024
-                )
-                
-                # Calculate reward
-                reward = self.reward_model.calculate_reward(
-                    prompt, 
-                    response,
-                    weights={
-                        "clip_score_weight": self.config.clip_score_weight,
-                        "svg_size_weight": self.config.svg_size_weight,
-                        "render_time_weight": self.config.render_time_weight
-                    }
-                )
-                
-                # Get log probabilities (for RL training)
-                log_probs = self.model_runner.get_logprobs(prompt, response)
-                
-                # Create sample
-                sample = GenerationSample(
-                    prompt=prompt,
-                    response=response,
-                    reward=reward,
-                    log_prob=sum(log_probs) / max(1, len(log_probs)),
-                    value=None  # Will be computed during training
-                )
-                
-                samples.append(sample)
-                
-        # Update stats
-        rewards = [s.reward for s in samples]
-        self.stats["samples_collected"] += len(samples)
-        self.stats["mean_reward"] = sum(rewards) / max(1, len(rewards))
-        self.stats["min_reward"] = min(rewards) if rewards else 0.0
-        self.stats["max_reward"] = max(rewards) if rewards else 0.0
-        self.stats["std_reward"] = (
-            (sum((r - self.stats["mean_reward"])**2 for r in rewards) / max(1, len(rewards)))**0.5
-            if rewards else 0.0
-        )
-        
-        self.samples.extend(samples)
-        return samples
-    
-    def train_iteration(self) -> Dict[str, float]:
-        """
-        Run one iteration of PPO training.
-        
-        Returns:
-            Training statistics
-        """
-        if not self.samples:
-            return {"error": "No samples collected"}
-            
-        # In a real implementation, this would:
-        # 1. Compute advantages and returns
-        # 2. Update policy using PPO loss
-        # 3. Update value function
-        
-        # For this implementation, we'll just track iterations
-        self.iteration += 1
-        self.stats["iterations"] = self.iteration
-        
-        return self.stats
-    
-    def save_model(self, path: str) -> None:
-        """
-        Save fine-tuned model.
-        
-        Args:
-            path: Path to save model
-        """
-        # In a real implementation, this would save the model weights
-        # For now, just log the action
-        logger.info(f"Model would be saved to {path}")
-        
-        # Create a simple report file
-        with open(f"{path}_stats.json", "w") as f:
-            json.dump(self.stats, f, indent=2)
 
 
 class LLMManager:
@@ -1390,48 +937,69 @@ class LLMManager:
     and refining SVG content with memory, performance, and RL-based optimization.
     """
     
+    _instance = None
+    _lock = threading.RLock()
+    
+    def __new__(cls, *args, **kwargs):
+        """Implement singleton pattern for resource efficiency."""
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super(LLMManager, cls).__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
+    
     def __init__(
         self,
-        model_config: Optional[ModelConfig] = None,
-        backend: ModelBackend = ModelBackend.ONNX,
-        rl_config: Optional[RLConfig] = None,
+        models_config: Optional[Dict[str, str]] = None,
+        cache_dir: str = ".cache/models",
+        device: str = "auto",
+        use_8bit: bool = False,
+        use_4bit: bool = True,
         cache_responses: bool = True,
-        preload_model: bool = False
+        preload_models: bool = False
     ):
         """
         Initialize LLM manager.
         
         Args:
-            model_config: Model configuration
-            backend: Model backend
-            rl_config: RL configuration
-            cache_responses: Whether to cache responses
-            preload_model: Whether to preload model
+            models_config: Configuration for different model roles
+            cache_dir: Directory for caching models
+            device: Device to use ("auto", "cuda", "cpu", "mps")
+            use_8bit: Whether to use 8-bit quantization
+            use_4bit: Whether to use 4-bit quantization
+            cache_responses: Whether to cache model responses
+            preload_models: Whether to preload models on initialization
         """
-        # Set up model configuration
-        self.model_config = model_config or self._default_model_config()
-        self.backend = backend
-        
-        # Set up model runner
-        self.model_runner = self._create_model_runner()
-        
-        # Set up RL if enabled
-        self.rl_config = rl_config or RLConfig(enabled=False)
-        self.reward_model = RewardModel() if self.rl_config.enabled else None
-        self.ppo_trainer = None
-        
-        if self.rl_config.enabled and self.reward_model:
-            self.ppo_trainer = PPOTrainer(
-                model_runner=self.model_runner,
-                reward_model=self.reward_model,
-                config=self.rl_config
-            )
+        # Initialize only once (singleton pattern)
+        if self._initialized:
+            return
             
-        # Set up response cache
-        self.cache_responses = cache_responses
-        self._cache = ResponseCache() if cache_responses else None
+        # Default model paths
+        self.models_config = models_config or {
+            "prompt_analyzer": "mistralai/Mistral-7B-Instruct-v0.2",
+            "svg_generator": "codellama/CodeLlama-7b-Instruct",
+            "default": "mistralai/Mistral-7B-Instruct-v0.2"
+        }
         
-        # Metrics
+        self.cache_dir = cache_dir
+        self.device = self._resolve_device(device)
+        self.use_8bit = use_8bit
+        self.use_4bit = use_4bit
+        self.cache_responses = cache_responses
+        
+        # Create cache directory
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Set up response cache
+        self._response_cache = ResponseCache() if cache_responses else None
+        
+        # Model runners by role
+        self._model_runners: Dict[str, ModelRunner] = {}
+        
+        # Set up memory management
+        self.memory_manager = MemoryManager()
+        
+        # Metrics tracking
         self._metrics = {
             "requests": 0,
             "cache_hits": 0,
@@ -1439,67 +1007,383 @@ class LLMManager:
             "errors": 0,
             "total_time": 0.0,
         }
-        self._metrics_lock = threading.RLock()
         
-        # Preload model if requested
-        if preload_model:
-            self.model_runner.preload()
+        # Set up threading resources
+        self._request_lock = threading.RLock()
+        self._request_queue = queue.Queue()
+        self._request_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
+        
+        # Initialize model configs
+        self._init_model_configs()
+        
+        # Preload models if requested
+        if preload_models:
+            self._preload_models()
+            
+        self._initialized = True
+        logger.info(f"LLM Manager initialized with device: {self.device}")
     
-    def _default_model_config(self) -> ModelConfig:
+    def _resolve_device(self, device: str) -> str:
         """
-        Create default model configuration.
+        Resolve device based on availability.
         
+        Args:
+            device: Requested device
+            
         Returns:
-            Default model configuration
+            Resolved device
         """
-        # Try to find a reasonable default model
-        local_models_dir = os.environ.get("LOCAL_MODELS_DIR", "models")
+        if device != "auto":
+            return device
+            
+        # Try to determine best available device
+        try:
+            # Check for CUDA
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+                
+            # Check for MPS (Apple Silicon)
+            if hasattr(torch, "mps") and torch.mps.is_available():
+                return "mps"
+                
+        except ImportError:
+            pass
+            
+        # Default to CPU
+        return "cpu"
+    
+    def _init_model_configs(self) -> None:
+        """Initialize model configurations."""
+        # Common configuration settings
+        common_config = {
+            "device": self.device,
+            "low_memory_mode": self.memory_manager.calculate_memory_pressure() > 0.7,
+            "threads": min(8, os.cpu_count() or 4)
+        }
         
-        # Check for common model paths
-        potential_models = [
-            (os.path.join(local_models_dir, "mistral-7b"), ModelType.MISTRAL_7B),
-            (os.path.join(local_models_dir, "llama-3-8b"), ModelType.LLAMA3_8B),
-            (os.path.join(local_models_dir, "codellama-7b"), ModelType.CODELLAMA_7B),
-        ]
+        # Determine quantization
+        quantization = None
+        if self.use_4bit:
+            quantization = "int4"
+        elif self.use_8bit:
+            quantization = "int8"
+            
+        # Configure models for different roles
+        self._model_configs = {}
         
-        for path, model_type in potential_models:
-            if os.path.exists(path):
-                return ModelConfig(
-                    model_type=model_type,
-                    model_path=path
+        # Prompt analyzer model
+        if "prompt_analyzer" in self.models_config:
+            model_path = self._resolve_model_path(self.models_config["prompt_analyzer"])
+            self._model_configs["prompt_analyzer"] = ModelConfig(
+                model_type=self._infer_model_type(model_path),
+                model_path=model_path,
+                quantization=quantization,
+                max_tokens=1024,
+                token_limit=8192,
+                **common_config
+            )
+            
+        # SVG generator model
+        if "svg_generator" in self.models_config:
+            model_path = self._resolve_model_path(self.models_config["svg_generator"])
+            self._model_configs["svg_generator"] = ModelConfig(
+                model_type=self._infer_model_type(model_path),
+                model_path=model_path,
+                quantization=quantization,
+                max_tokens=4096,
+                token_limit=8192,
+                supports_svg=True,
+                **common_config
+            )
+            
+        # Default model
+        default_model_path = self._resolve_model_path(self.models_config.get("default", ""))
+        self._model_configs["default"] = ModelConfig(
+            model_type=self._infer_model_type(default_model_path),
+            model_path=default_model_path,
+            quantization=quantization,
+            max_tokens=1024,
+            **common_config
+        )
+        
+        logger.info(f"Initialized {len(self._model_configs)} model configurations")
+    
+    def _resolve_model_path(self, model_name: str) -> str:
+        """
+        Resolve model path from model name.
+        
+        Args:
+            model_name: Model name or path
+            
+        Returns:
+            Resolved model path
+        """
+        # Check if it's already a local path
+        if os.path.exists(model_name):
+            return model_name
+            
+        # Check common model formats
+        if '/' in model_name:
+            # Format: organization/model_name
+            org, model = model_name.split('/', 1)
+            
+            # Check if model exists in cache directory
+            local_path = os.path.join(self.cache_dir, org, model)
+            if os.path.exists(local_path):
+                return local_path
+                
+            # Try with GGUF format
+            gguf_path = os.path.join(self.cache_dir, f"{model}.gguf")
+            if os.path.exists(gguf_path):
+                return gguf_path
+                
+            # Otherwise, return a path in the cache directory (model will need to be downloaded)
+            # In a real implementation, you would download the model here
+            # For now, we just return the expected path
+            return os.path.join(self.cache_dir, f"{model}.gguf")
+        else:
+            # Just a model name, check if it exists in cache
+            local_path = os.path.join(self.cache_dir, model_name)
+            if os.path.exists(local_path):
+                return local_path
+                
+            # Try with GGUF format
+            gguf_path = os.path.join(self.cache_dir, f"{model_name}.gguf")
+            if os.path.exists(gguf_path):
+                return gguf_path
+                
+            # Return expected path
+            return os.path.join(self.cache_dir, f"{model_name}.gguf")
+    
+    def _infer_model_type(self, model_path: str) -> ModelType:
+        """
+        Infer model type from model path.
+        
+        Args:
+            model_path: Model path
+            
+        Returns:
+            Inferred model type
+        """
+        model_name = os.path.basename(model_path).lower()
+        
+        if "mistral" in model_name:
+            if "instruct" in model_name:
+                return ModelType.MISTRAL_INSTRUCT
+            else:
+                return ModelType.MISTRAL_7B
+        elif "llama-3" in model_name or "llama3" in model_name:
+            if "instruct" in model_name:
+                return ModelType.LLAMA3_INSTRUCT
+            else:
+                return ModelType.LLAMA3_8B
+        elif "codellama" in model_name:
+            if "instruct" in model_name:
+                return ModelType.CODELLAMA_INSTRUCT
+            else:
+                return ModelType.CODELLAMA_7B
+        elif "stablelm" in model_name:
+            return ModelType.STABLE_LM
+        else:
+            return ModelType.CUSTOM
+    
+    def _preload_models(self) -> None:
+        """Preload models into memory."""
+        thread_pool = get_thread_pool()
+        futures = []
+        
+        for role, config in self._model_configs.items():
+            # Skip default if it's the same as another model
+            if role == "default" and config.model_path in [cfg.model_path for role, cfg in self._model_configs.items() if role != "default"]:
+                continue
+                
+            futures.append(thread_pool.submit(self.load_model, role))
+            
+        # Wait for models to load
+        for future in futures:
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Error preloading model: {str(e)}")
+    
+    @log_function_call(level=logging.DEBUG)
+    def load_model(self, role: str) -> bool:
+        """
+        Load a model for a specific role.
+        
+        Args:
+            role: Role of the model to load
+            
+        Returns:
+            Whether the model was loaded successfully
+        """
+        with self._request_lock:
+            # Check if model is already loaded
+            if role in self._model_runners and self._model_runners[role]._initialized:
+                return True
+                
+            # Get model config for role
+            if role not in self._model_configs:
+                role = "default"  # Fall back to default model
+                
+            # If still not found, return failure
+            if role not in self._model_configs:
+                logger.error(f"No model configuration found for role: {role}")
+                return False
+                
+            config = self._model_configs[role]
+            
+            try:
+                with Profiler(f"load_model_{role}"):
+                    # Create model runner based on model path
+                    if os.path.exists(config.model_path) and config.model_path.endswith((".gguf", ".bin")):
+                        # Use LLaMA.cpp for GGUF models
+                        model_runner = LLaMACppRunner(config)
+                    else:
+                        # Use CTransformers for most other cases
+                        model_runner = CTModelRunner(config)
+                        
+                    # Initialize model
+                    model_runner.preload()
+                    
+                    # Store model runner
+                    self._model_runners[role] = model_runner
+                    
+                    logger.info(f"Successfully loaded model for role: {role}")
+                    return True
+                    
+            except Exception as e:
+                logger.error(f"Failed to load model for role {role}: {str(e)}")
+                return False
+    
+    @log_function_call(level=logging.DEBUG)
+    def generate(
+        self,
+        prompt: PromptType,
+        role: str = "default",
+        max_tokens: Optional[int] = None,
+        temperature: float = DEFAULT_TEMPERATURE,
+        top_p: float = 0.9,
+        top_k: int = 40,
+        stop_sequences: Optional[List[str]] = None,
+        use_cache: bool = True,
+        **kwargs
+    ) -> str:
+        """
+        Generate text from prompt.
+        
+        Args:
+            prompt: Text prompt or message list
+            role: Role of the model to use
+            max_tokens: Maximum tokens to generate
+            temperature: Temperature for sampling
+            top_p: Top-p sampling parameter
+            top_k: Top-k sampling parameter
+            stop_sequences: Sequences to stop generation
+            use_cache: Whether to use response cache
+            **kwargs: Additional parameters
+            
+        Returns:
+            Generated text
+        """
+        # Check cache if enabled
+        if use_cache and self.cache_responses and self._response_cache:
+            cache_key = self._create_cache_key(prompt, role, max_tokens, temperature, top_p, top_k)
+            cached = self._response_cache.get(cache_key)
+            
+            if cached:
+                self._increment_metric("cache_hits")
+                return cached.get("content", "")
+                
+        # Acquire semaphore to limit concurrent requests
+        with self._request_semaphore:
+            try:
+                # Ensure model is loaded
+                if not self.load_model(role):
+                    raise ValueError(f"Failed to load model for role: {role}")
+                    
+                # Get model runner
+                model_runner = self._model_runners[role]
+                
+                # Generate text
+                generated_text, generation_info = model_runner.generate(
+                    prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    stop_sequences=stop_sequences,
+                    **kwargs
                 )
                 
-        # Fallback to a default configuration
-        return ModelConfig(
-            model_type=ModelType.LLAMA3_8B,
-            model_path=os.path.join(local_models_dir, "llama-3-8b"),
-            quantization="int8"
+                # Create response
+                response = {
+                    "content": generated_text,
+                    "usage": generation_info,
+                    "model": role,
+                }
+                
+                # Cache response if enabled
+                if use_cache and self.cache_responses and self._response_cache:
+                    self._response_cache.set(cache_key, response)
+                    
+                # Update metrics
+                self._increment_metric("requests")
+                
+                return generated_text
+                
+            except Exception as e:
+                logger.error(f"Error generating text: {str(e)}")
+                self._increment_metric("errors")
+                return ""
+    
+    @log_function_call(level=logging.DEBUG)
+    def generate_chat(
+        self,
+        messages: List[Dict[str, str]],
+        role: str = "default",
+        max_tokens: Optional[int] = None,
+        temperature: float = DEFAULT_TEMPERATURE,
+        use_cache: bool = True,
+        **kwargs
+    ) -> str:
+        """
+        Generate response for chat messages.
+        
+        Args:
+            messages: List of message dictionaries
+            role: Role of the model to use
+            max_tokens: Maximum tokens to generate
+            temperature: Temperature for sampling
+            use_cache: Whether to use response cache
+            **kwargs: Additional parameters
+            
+        Returns:
+            Generated response
+        """
+        # Call generate with message list
+        return self.generate(
+            prompt=messages,
+            role=role,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            use_cache=use_cache,
+            **kwargs
         )
     
-    def _create_model_runner(self) -> ModelRunner:
-        """
-        Create model runner based on backend.
-        
-        Returns:
-            Model runner
-        """
-        if self.backend == ModelBackend.ONNX:
-            return OnnxModelRunner(self.model_config)
-        elif self.backend == ModelBackend.LLAMACPP:
-            return LLaMACppRunner(self.model_config)
-        elif self.backend == ModelBackend.CTRANSFORMERS:
-            return CTModelRunner(self.model_config)
-        else:
-            # Default to ONNX
-            return OnnxModelRunner(self.model_config)
-    
-    def _create_cache_key(self, prompt: PromptType, **kwargs) -> str:
+    def _create_cache_key(self, prompt: PromptType, role: str, max_tokens: Optional[int], 
+                        temperature: float, top_p: float, top_k: int) -> str:
         """
         Create cache key for a request.
         
         Args:
             prompt: Text prompt or message list
-            **kwargs: Additional request parameters
+            role: Role of the model
+            max_tokens: Maximum tokens
+            temperature: Temperature
+            top_p: Top-p value
+            top_k: Top-k value
             
         Returns:
             Cache key
@@ -1520,189 +1404,17 @@ class LLMManager:
             
         # Create key components
         key_parts = [
-            self.model_config.model_type.name,
+            role,
             prompt_str,
-            str(kwargs.get("temperature", DEFAULT_TEMPERATURE)),
-            str(kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)),
-            str(kwargs.get("top_p", 0.9)),
+            str(max_tokens),
+            str(temperature),
+            str(top_p),
+            str(top_k)
         ]
         
         # Join and hash
         key_str = "|".join(key_parts)
         return hashlib.md5(key_str.encode()).hexdigest()
-    
-    @log_function_call(level=logging.DEBUG)
-    def complete(
-        self,
-        prompt: PromptType,
-        use_cache: bool = True,
-        **kwargs
-    ) -> ResponseType:
-        """
-        Get completion from LLM.
-        
-        Args:
-            prompt: Text prompt or message list
-            use_cache: Whether to use cache
-            **kwargs: Additional parameters (temperature, max_tokens, etc.)
-            
-        Returns:
-            Model response
-            
-        Raises:
-            Exception: If request fails
-        """
-        start_time = time.time()
-        
-        # Check cache if enabled
-        if use_cache and self.cache_responses and self._cache:
-            cache_key = self._create_cache_key(prompt, **kwargs)
-            cached = self._cache.get(cache_key)
-            
-            if cached:
-                self._increment_metric("cache_hits")
-                return cached
-            else:
-                self._increment_metric("cache_misses")
-                
-        # Generate completion
-        try:
-            # Generate response
-            generated_text, generation_info = self.model_runner.generate(
-                prompt,
-                **kwargs
-            )
-            
-            # Create response
-            response = {
-                "content": generated_text,
-                "usage": generation_info,
-                "model": self.model_config.model_type.name,
-            }
-            
-            # Apply RL optimization if enabled
-            if self.rl_config.enabled and self.ppo_trainer and 'svg' in str(prompt).lower():
-                # This would normally happen in a separate training loop,
-                # but here we'll collect samples for learning
-                self.ppo_trainer.collect_samples([prompt], num_samples_per_prompt=1)
-                
-            # Cache response if enabled
-            if use_cache and self.cache_responses and self._cache:
-                self._cache.set(cache_key, response)
-                
-            # Update metrics
-            self._increment_metric("requests")
-            self._update_metric("total_time", time.time() - start_time)
-            
-            return response
-            
-        except Exception as e:
-            # Update metrics
-            self._increment_metric("errors")
-            
-            # Re-raise exception
-            raise e
-    
-    @log_function_call(level=logging.DEBUG)
-    def complete_chat(
-        self,
-        messages: List[Dict[str, str]],
-        use_cache: bool = True,
-        **kwargs
-    ) -> ResponseType:
-        """
-        Get completion from chat messages.
-        
-        Args:
-            messages: List of chat messages
-            use_cache: Whether to use cache
-            **kwargs: Additional parameters
-            
-        Returns:
-            Model response
-        """
-        # Call complete with message list
-        return self.complete(messages, use_cache, **kwargs)
-    
-    def train_rl(
-        self,
-        prompts: List[str],
-        iterations: int = 1,
-        samples_per_prompt: int = 4
-    ) -> Dict[str, Any]:
-        """
-        Train model using reinforcement learning.
-        
-        Args:
-            prompts: Training prompts
-            iterations: Number of training iterations
-            samples_per_prompt: Number of samples per prompt
-            
-        Returns:
-            Training statistics
-            
-        Raises:
-            ValueError: If RL is not enabled
-        """
-        if not self.rl_config.enabled or not self.ppo_trainer:
-            raise ValueError("Reinforcement learning is not enabled")
-            
-        # Collect samples
-        self.ppo_trainer.collect_samples(prompts, samples_per_prompt)
-        
-        # Run training iterations
-        stats = {}
-        for i in range(iterations):
-            iter_stats = self.ppo_trainer.train_iteration()
-            stats[f"iteration_{i+1}"] = iter_stats
-            
-        # Final stats
-        final_stats = self.ppo_trainer.stats.copy()
-        final_stats["training_completed"] = True
-        
-        return final_stats
-    
-    def save_rl_model(self, path: str) -> None:
-        """
-        Save RL-trained model.
-        
-        Args:
-            path: Path to save model
-            
-        Raises:
-            ValueError: If RL is not enabled
-        """
-        if not self.rl_config.enabled or not self.ppo_trainer:
-            raise ValueError("Reinforcement learning is not enabled")
-            
-        # Save model
-        self.ppo_trainer.save_model(path)
-    
-    def get_metrics(self) -> Dict[str, Any]:
-        """
-        Get request metrics.
-        
-        Returns:
-            Dictionary with metrics
-        """
-        with self._metrics_lock:
-            metrics = self._metrics.copy()
-            
-            # Add derived metrics
-            if metrics["requests"] > 0:
-                metrics["cache_hit_rate"] = metrics["cache_hits"] / metrics["requests"]
-                metrics["error_rate"] = metrics["errors"] / metrics["requests"]
-                metrics["avg_request_time"] = metrics["total_time"] / (metrics["requests"] - metrics["cache_hits"])
-            else:
-                metrics["cache_hit_rate"] = 0.0
-                metrics["error_rate"] = 0.0
-                metrics["avg_request_time"] = 0.0
-                
-            # Add RL metrics if available
-            if self.rl_config.enabled and self.ppo_trainer:
-                metrics["rl"] = self.ppo_trainer.stats
-                
-            return metrics
     
     def _increment_metric(self, name: str, value: int = 1) -> None:
         """
@@ -1712,37 +1424,46 @@ class LLMManager:
             name: Metric name
             value: Value to increment by
         """
-        with self._metrics_lock:
+        with self._request_lock:
             if name in self._metrics:
                 self._metrics[name] += value
     
-    def _update_metric(self, name: str, value: Any) -> None:
+    def get_metrics(self) -> Dict[str, Any]:
         """
-        Update a metric.
+        Get request metrics.
         
-        Args:
-            name: Metric name
-            value: New value
+        Returns:
+            Dictionary with metrics
         """
-        with self._metrics_lock:
-            if name in self._metrics:
-                self._metrics[name] = value
-    
-    def reset_metrics(self) -> None:
-        """Reset all metrics."""
-        with self._metrics_lock:
-            for key in self._metrics:
-                self._metrics[key] = 0
+        with self._request_lock:
+            metrics = self._metrics.copy()
+            
+            # Add derived metrics
+            if metrics["requests"] > 0:
+                metrics["cache_hit_rate"] = metrics["cache_hits"] / metrics["requests"]
+                metrics["error_rate"] = metrics["errors"] / metrics["requests"]
+                if metrics["requests"] > metrics["cache_hits"]:
+                    metrics["avg_request_time"] = metrics["total_time"] / (metrics["requests"] - metrics["cache_hits"])
+                else:
+                    metrics["avg_request_time"] = 0.0
+            else:
+                metrics["cache_hit_rate"] = 0.0
+                metrics["error_rate"] = 0.0
+                metrics["avg_request_time"] = 0.0
+                
+            return metrics
     
     def clear_cache(self) -> None:
         """Clear response cache."""
-        if self.cache_responses and self._cache:
-            self._cache.clear()
+        if self.cache_responses and self._response_cache:
+            self._response_cache.clear()
     
-    def unload_model(self) -> None:
-        """Unload model from memory."""
-        if self.model_runner:
-            self.model_runner.unload()
+    def unload_models(self) -> None:
+        """Unload all models from memory."""
+        with self._request_lock:
+            for runner in self._model_runners.values():
+                runner.unload()
+            self._model_runners.clear()
     
     def __enter__(self):
         """Context manager entry."""
@@ -1750,45 +1471,37 @@ class LLMManager:
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit."""
-        self.unload_model()
+        self.unload_models()
 
 
-# Create singleton instance for easy import
-default_llm_manager = LLMManager()
-
-
-# High-level utility functions
-def get_text_completion(
-    prompt: str,
-    model_config: Optional[ModelConfig] = None,
-    **kwargs
-) -> str:
+# Utility functions for working with SVG generation
+def extract_svg_from_text(text: str) -> Optional[str]:
     """
-    Get text completion from LLM.
+    Extract SVG code from text.
     
     Args:
-        prompt: Text prompt
-        model_config: Model configuration
-        **kwargs: Additional request parameters
+        text: Text to extract SVG from
         
     Returns:
-        Generated text
+        Extracted SVG or None if not found
     """
-    manager = default_llm_manager
-    
-    # Create a new manager if config provided
-    if model_config:
-        manager = LLMManager(model_config=model_config)
+    # Try to find SVG in code blocks
+    svg_match = re.search(r'```(?:html|svg|xml)?\s*((?:<\?xml|<svg).*?</svg>)', text, re.DOTALL)
+    if svg_match:
+        return svg_match.group(1).strip()
         
-    # Generate response
-    response = manager.complete(prompt, **kwargs)
-    
-    return response.get("content", "")
+    # If no explicit code block, try to find SVG tags directly
+    svg_match = re.search(r'(?:<\?xml|<svg).*?</svg>', text, re.DOTALL)
+    if svg_match:
+        return svg_match.group(0).strip()
+        
+    # No SVG found
+    return None
 
 
 def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     """
-    Extract JSON from text response.
+    Extract JSON from text.
     
     Args:
         text: Text to extract JSON from
@@ -1820,29 +1533,34 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def extract_svg_from_text(text: str) -> Optional[str]:
+# Create singleton instance for easy access
+default_llm_manager = LLMManager()
+
+
+# Utility functions
+def get_text_completion(prompt: str, **kwargs) -> str:
     """
-    Extract SVG from text response.
+    Get simple text completion.
     
     Args:
-        text: Text to extract SVG from
+        prompt: Text prompt
+        **kwargs: Additional parameters
         
     Returns:
-        Extracted SVG or None if not found
+        Generated text
     """
-    # Try to find SVG in code blocks
-    svg_pattern = r"```(?:html|svg|xml)?\s*((?:<svg[\s\S]*?<\/svg>))\s*```"
-    matches = re.findall(svg_pattern, text)
+    return default_llm_manager.generate(prompt, **kwargs)
+
+
+def get_chat_completion(messages: List[Dict[str, str]], **kwargs) -> str:
+    """
+    Get chat completion.
     
-    if matches:
-        return matches[0]
+    Args:
+        messages: Chat messages
+        **kwargs: Additional parameters
         
-    # Try to find SVG tags directly
-    svg_pattern = r"(<svg[\s\S]*?<\/svg>)"
-    matches = re.findall(svg_pattern, text)
-    
-    if matches:
-        return matches[0]
-        
-    # No SVG found
-    return None
+    Returns:
+        Generated response
+    """
+    return default_llm_manager.generate_chat(messages, **kwargs)
