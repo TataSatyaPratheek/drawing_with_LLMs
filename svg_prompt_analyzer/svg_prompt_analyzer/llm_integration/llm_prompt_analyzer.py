@@ -8,18 +8,21 @@ import re
 import json
 import time
 import hashlib
+import threading
 from typing import Dict, List, Tuple, Optional, Union, Any, Set
 from enum import Enum, auto
 from dataclasses import dataclass, field
 
 # Import core optimizations
-from svg_prompt_analyzer.core import CONFIG, memoize, Profiler
+from svg_prompt_analyzer.core import CONFIG, memoize, Profiler, jit
 from svg_prompt_analyzer.core.memory_manager import MemoryManager
+from svg_prompt_analyzer.core.batch_processor import BatchProcessor
+from svg_prompt_analyzer.core.hardware_manager import HardwareManager
 from svg_prompt_analyzer.utils.logger import get_logger, log_function_call
 
 # Import LLM manager for prompt enhancement
 from svg_prompt_analyzer.llm_integration.llm_manager import (
-    LLMManager, extract_json_from_text
+    LLMManager, ModelType, extract_json_from_text
 )
 
 # Configure logger
@@ -31,6 +34,7 @@ JsonDict = Dict[str, Any]
 
 # Get memory manager instance
 memory_manager = MemoryManager()
+hardware_manager = HardwareManager()
 
 
 class PromptCategory(Enum):
@@ -187,7 +191,9 @@ class LLMPromptAnalyzer:
         use_fallback: bool = True,
         fallback_threshold: float = 0.7,
         use_caching: bool = True,
-        cache_size: int = 100
+        cache_size: int = 100,
+        batch_size: int = 8,
+        num_workers: int = 4
     ):
         """
         Initialize prompt analyzer.
@@ -198,10 +204,34 @@ class LLMPromptAnalyzer:
             fallback_threshold: Confidence threshold for fallback
             use_caching: Whether to cache analysis results
             cache_size: Maximum cache size
+            batch_size: Size of batches for parallel processing
+            num_workers: Number of worker threads
         """
         self.llm_manager = llm_manager or LLMManager()
         self.use_fallback = use_fallback
         self.fallback_threshold = fallback_threshold
+        
+        # Get optimal device configuration
+        optimal_device = hardware_manager.get_optimal_device()
+        device_memory = hardware_manager.get_device_memory_stats()
+        
+        # Adjust batch size based on available memory
+        if optimal_device == "cuda" and "allocated" in device_memory:
+            # Limit batch size if GPU memory is constrained
+            total_mem = sum([m for m in device_memory["total"].values()])
+            used_mem = sum([m for m in device_memory["allocated"].values()])
+            if used_mem / total_mem > 0.5:  # More than 50% used
+                batch_size = min(batch_size, 4)
+                logger.info(f"Limiting batch size to {batch_size} due to GPU memory usage")
+        
+        # Adjust workers based on device
+        if optimal_device == "cpu":
+            # Reduce worker count on CPU to avoid overload
+            num_workers = min(num_workers, hardware_manager.hardware_info.get("cpu_count", 4) // 2)
+            num_workers = max(1, num_workers)
+        
+        self.batch_size = batch_size
+        self.num_workers = num_workers
         
         # Set up keyword extractor
         self.keyword_extractor = KeywordExtractor()
@@ -210,8 +240,23 @@ class LLMPromptAnalyzer:
         self.use_caching = use_caching
         self._cache = {}
         self._cache_size = cache_size
+        self._cache_lock = threading.Lock()
+        
+        # Batch processor for parallel processing
+        self.batch_processor = BatchProcessor(
+            process_func=self._process_analysis_batch,
+            optimal_batch_size=self.batch_size,
+            max_batch_size=self.batch_size * 2,
+            min_batch_size=1,
+            adaptive_batching=True,
+            memory_manager=memory_manager
+        )
+        self.batch_processor.start()
+        
+        logger.info(f"LLM Prompt Analyzer initialized with batch_size={batch_size}, workers={num_workers} on {optimal_device}")
     
     @log_function_call()
+    @memory_manager.memory_efficient_function
     def analyze_prompt(self, prompt_id: str, prompt: str) -> Dict[str, Any]:
         """
         Analyze prompt to create scene representation.
@@ -226,8 +271,9 @@ class LLMPromptAnalyzer:
         # Check cache
         if self.use_caching:
             cache_key = self._create_cache_key(prompt)
-            if cache_key in self._cache:
-                return self._cache[cache_key]
+            with self._cache_lock:
+                if cache_key in self._cache:
+                    return self._cache[cache_key]
         
         with Profiler("llm_prompt_analysis"):
             try:
@@ -314,6 +360,134 @@ class LLMPromptAnalyzer:
                 # Raise error if fallback not enabled
                 raise
     
+    @log_function_call()
+    def analyze_prompts_batch(self, prompt_pairs: List[Tuple[str, str]]) -> List[Dict[str, Any]]:
+        """
+        Analyze multiple prompts in parallel.
+        
+        Args:
+            prompt_pairs: List of (prompt_id, prompt) tuples
+            
+        Returns:
+            List of scene representations
+        """
+        if not prompt_pairs:
+            return []
+        
+        logger.info(f"Analyzing batch of {len(prompt_pairs)} prompts")
+        
+        # Check cache for each prompt
+        results = []
+        prompts_to_analyze = []
+        
+        for prompt_id, prompt in prompt_pairs:
+            if self.use_caching:
+                cache_key = self._create_cache_key(prompt)
+                with self._cache_lock:
+                    if cache_key in self._cache:
+                        results.append((prompt_id, self._cache[cache_key]))
+                        continue
+            
+            prompts_to_analyze.append((prompt_id, prompt))
+        
+        if not prompts_to_analyze:
+            # All results were cached
+            return [result[1] for result in results]
+        
+        # Process batch with batch processor
+        try:
+            with Profiler("batch_prompt_analysis"):
+                # Add tasks to batch processor
+                for prompt_id, prompt in prompts_to_analyze:
+                    self.batch_processor.add_item(prompt_id, (prompt_id, prompt))
+                
+                # Collect results
+                batch_results = {}
+                
+                # Wait for all results with timeout
+                timeout_per_item = 15.0  # 15 seconds per item
+                total_timeout = max(60.0, len(prompts_to_analyze) * timeout_per_item)
+                
+                start_time = time.time()
+                while len(batch_results) < len(prompts_to_analyze):
+                    # Check timeout
+                    if time.time() - start_time > total_timeout:
+                        logger.warning("Batch processing timeout reached")
+                        break
+                    
+                    # Process completed items
+                    for prompt_id, _ in prompts_to_analyze:
+                        if prompt_id not in batch_results:
+                            result = self.batch_processor.get_result(prompt_id, timeout=0.1)
+                            if result:
+                                batch_results[prompt_id] = result
+                    
+                    # Short sleep to prevent CPU spinning
+                    time.sleep(0.1)
+                
+                # Process any remaining items sequentially
+                for prompt_id, prompt in prompts_to_analyze:
+                    if prompt_id not in batch_results:
+                        try:
+                            scene = self.analyze_prompt(prompt_id, prompt)
+                            batch_results[prompt_id] = scene
+                        except Exception as e:
+                            logger.error(f"Error analyzing prompt {prompt_id}: {str(e)}")
+                            # Use fallback if enabled
+                            if self.use_fallback:
+                                batch_results[prompt_id] = self._fallback_analysis(prompt_id, prompt)
+                
+                # Combine results
+                for prompt_id, _ in prompts_to_analyze:
+                    if prompt_id in batch_results:
+                        results.append((prompt_id, batch_results[prompt_id]))
+                
+        except Exception as e:
+            logger.error(f"Error in batch prompt analysis: {str(e)}")
+            
+            # Fall back to sequential processing
+            for prompt_id, prompt in prompts_to_analyze:
+                try:
+                    scene = self.analyze_prompt(prompt_id, prompt)
+                    results.append((prompt_id, scene))
+                except Exception as err:
+                    logger.error(f"Error analyzing prompt {prompt_id}: {str(err)}")
+                    if self.use_fallback:
+                        results.append((prompt_id, self._fallback_analysis(prompt_id, prompt)))
+        
+        # Memory checkpoint
+        memory_manager.operation_checkpoint()
+        
+        # Sort results by original order
+        id_to_index = {prompt_id: i for i, (prompt_id, _) in enumerate(prompt_pairs)}
+        sorted_results = sorted(results, key=lambda x: id_to_index.get(x[0], 999999))
+        
+        return [result[1] for result in sorted_results]
+    
+    def _process_analysis_batch(self, items: List[Tuple[str, str]]) -> List[Dict[str, Any]]:
+        """Process a batch of prompts for the batch processor."""
+        results = []
+        for prompt_id, prompt in items:
+            try:
+                result = self.analyze_prompt(prompt_id, prompt)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Error in batch item processing: {str(e)}")
+                if self.use_fallback:
+                    results.append(self._fallback_analysis(prompt_id, prompt))
+                else:
+                    # Return empty scene as fallback
+                    results.append({
+                        "id": prompt_id,
+                        "prompt": prompt,
+                        "width": 800,
+                        "height": 600,
+                        "background_color": "#FFFFFF",
+                        "objects": [],
+                        "relationships": []
+                    })
+        return results
+    
     @memory_manager.memory_efficient_function
     def _fallback_analysis(self, prompt_id: str, prompt: str) -> Dict[str, Any]:
         """
@@ -368,6 +542,7 @@ class LLMPromptAnalyzer:
             
             return scene
     
+    @jit
     def _extract_colors(self, text: str) -> List[str]:
         """
         Extract color references from text.
@@ -448,17 +623,19 @@ class LLMPromptAnalyzer:
             key: Cache key
             result: Analysis result to cache
         """
-        # Manage cache size
-        if len(self._cache) >= self._cache_size:
-            # Remove random item (simple strategy)
-            keys = list(self._cache.keys())
-            if keys:
-                del self._cache[keys[0]]
-        
-        # Add to cache
-        self._cache[key] = result
+        with self._cache_lock:
+            # Manage cache size
+            if len(self._cache) >= self._cache_size:
+                # Remove random item (simple strategy)
+                keys = list(self._cache.keys())
+                if keys:
+                    del self._cache[keys[0]]
+            
+            # Add to cache
+            self._cache[key] = result
     
     @log_function_call()
+    @memory_manager.memory_efficient_function
     def enhance_prompt(self, prompt: str, target_length: int = 150) -> str:
         """
         Enhance a prompt for better SVG generation.
@@ -515,10 +692,162 @@ class LLMPromptAnalyzer:
             except Exception as e:
                 logger.error(f"Error enhancing prompt: {str(e)}")
                 return prompt
+    
+    @log_function_call()
+    def analyze(self, prompt: str) -> PromptAnalysis:
+        """
+        Perform detailed analysis of a prompt.
+        
+        Args:
+            prompt: Text prompt to analyze
+            
+        Returns:
+            Detailed prompt analysis
+        """
+        start_time = time.time()
+        
+        try:
+            with Profiler("detailed_prompt_analysis"):
+                # Create system prompt for detailed analysis
+                system_prompt = """You are an expert in visual prompt analysis for SVG generation.
+                Analyze the given prompt in detail to extract meaningful components for visualization.
+                
+                Return a JSON object with the following structure:
+                {
+                  "subject": "main subject of the prompt",
+                  "objects": ["list", "of", "main", "objects"],
+                  "attributes": {
+                    "object1": ["attr1", "attr2"],
+                    "object2": ["attr1", "attr2"]
+                  },
+                  "colors": ["colors", "mentioned"],
+                  "style_cues": ["style", "indicators"],
+                  "category": "SCENE|OBJECT|STYLE|CONCEPT|TECHNICAL|AMBIGUOUS|COMPLEX|MINIMAL",
+                  "complexity": 0.0-1.0,
+                  "issues": ["potential", "issues"],
+                  "suggestions": ["suggestions", "for", "improvement"]
+                }"""
+                
+                user_prompt = f'Analyze this prompt for SVG generation: "{prompt}"'
+                
+                # Generate analysis with LLM
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+                
+                response = self.llm_manager.generate(
+                    role="prompt_analyzer",
+                    prompt=messages,
+                    max_tokens=1024,
+                    temperature=0.2
+                )
+                
+                # Extract JSON from response
+                analysis_data = extract_json_from_text(response)
+                
+                if not analysis_data:
+                    raise ValueError("Failed to extract valid analysis data from LLM response")
+                
+                # Extract category enum from string if present
+                category = None
+                if "category" in analysis_data and analysis_data["category"]:
+                    try:
+                        category = PromptCategory[analysis_data["category"]]
+                    except (KeyError, ValueError):
+                        # Default to AMBIGUOUS if invalid category
+                        category = PromptCategory.AMBIGUOUS
+                
+                # Get keywords
+                keywords = self.keyword_extractor.extract_keywords(prompt)
+                
+                # Enhance prompt
+                enhanced_prompt = self.enhance_prompt(prompt)
+                
+                # Create analysis object
+                analysis = PromptAnalysis(
+                    original_prompt=prompt,
+                    enhanced_prompt=enhanced_prompt,
+                    subject=analysis_data.get("subject"),
+                    objects=analysis_data.get("objects", []),
+                    attributes=analysis_data.get("attributes", {}),
+                    colors=analysis_data.get("colors", []),
+                    style_cues=analysis_data.get("style_cues", []),
+                    category=category,
+                    complexity=analysis_data.get("complexity", 0.5),
+                    issues=analysis_data.get("issues", []),
+                    suggestions=analysis_data.get("suggestions", []),
+                    keywords=keywords,
+                    processing_time=time.time() - start_time
+                )
+                
+                return analysis
+                
+        except Exception as e:
+            logger.error(f"Error in detailed prompt analysis: {str(e)}")
+            
+            # Create fallback analysis
+            keywords = self.keyword_extractor.extract_keywords(prompt)
+            colors = self._extract_colors(prompt)
+            
+            return PromptAnalysis(
+                original_prompt=prompt,
+                objects=keywords[:3],
+                colors=colors,
+                category=PromptCategory.AMBIGUOUS,
+                complexity=0.5,
+                keywords=keywords,
+                processing_time=time.time() - start_time
+            )
+    
+    def get_structured_prompt(self, prompt: str) -> Dict[str, Any]:
+        """
+        Get a structured representation of a prompt for SVG generation.
+        
+        Args:
+            prompt: Original prompt
+            
+        Returns:
+            Structured representation
+        """
+        # Analyze the prompt
+        analysis = self.analyze(prompt)
+        
+        # Create structured representation
+        structured = {
+            "original_prompt": prompt,
+            "enhanced_prompt": analysis.enhanced_prompt,
+            "elements": analysis.objects,
+            "colors": analysis.colors,
+            "style": analysis.style_cues,
+            "category": analysis.category.name if analysis.category else "AMBIGUOUS",
+            "attributes": analysis.attributes
+        }
+        
+        return structured
+    
+    def shutdown(self) -> None:
+        """Cleanup resources."""
+        logger.info("Shutting down LLMPromptAnalyzer")
+        
+        # Stop batch processor
+        if hasattr(self, 'batch_processor'):
+            self.batch_processor.stop(wait_complete=True)
+            
+        # Clear cache
+        with self._cache_lock:
+            self._cache.clear()
 
 
 # Create singleton instance for easy import
-default_prompt_analyzer = LLMPromptAnalyzer()
+_default_prompt_analyzer = None
+
+def get_default_prompt_analyzer() -> LLMPromptAnalyzer:
+    """Get default prompt analyzer instance."""
+    global _default_prompt_analyzer
+    if _default_prompt_analyzer is None:
+        _default_prompt_analyzer = LLMPromptAnalyzer()
+    return _default_prompt_analyzer
 
 
 # Utility functions for direct use
@@ -533,7 +862,7 @@ def analyze_prompt(prompt_id: str, prompt: str) -> Dict[str, Any]:
     Returns:
         Scene representation dictionary
     """
-    return default_prompt_analyzer.analyze_prompt(prompt_id, prompt)
+    return get_default_prompt_analyzer().analyze_prompt(prompt_id, prompt)
 
 
 def enhance_prompt(prompt: str) -> str:
@@ -546,4 +875,17 @@ def enhance_prompt(prompt: str) -> str:
     Returns:
         Enhanced prompt
     """
-    return default_prompt_analyzer.enhance_prompt(prompt)
+    return get_default_prompt_analyzer().enhance_prompt(prompt)
+
+
+def analyze(prompt: str) -> PromptAnalysis:
+    """
+    Perform detailed analysis of a prompt.
+    
+    Args:
+        prompt: Text prompt to analyze
+        
+    Returns:
+        Detailed prompt analysis
+    """
+    return get_default_prompt_analyzer().analyze(prompt)

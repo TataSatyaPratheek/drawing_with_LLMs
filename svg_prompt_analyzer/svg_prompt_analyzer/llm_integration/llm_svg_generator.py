@@ -16,28 +16,39 @@ import xml.dom.minidom as minidom
 from typing import Dict, List, Tuple, Optional, Union, Any, Set, Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from pathlib import Path
 
 # Import core optimizations
-from core import CONFIG, memoize, Profiler, get_thread_pool
-from utils.logger import get_logger, log_function_call
+from svg_prompt_analyzer.core import CONFIG, memoize, Profiler, get_thread_pool
+from svg_prompt_analyzer.core.memory_manager import MemoryManager
+from svg_prompt_analyzer.core.batch_processor import BatchProcessor
+from svg_prompt_analyzer.core.hardware_manager import HardwareManager
+from svg_prompt_analyzer.utils.logger import get_logger, log_function_call
 
 # Import LLM manager for generating SVGs
-from llm_integration.llm_manager import (
-    LLMManager, ModelType, default_llm_manager, 
-    extract_svg_from_text, extract_json_from_text
+from svg_prompt_analyzer.llm_integration.llm_manager import (
+    LLMManager, ModelType, extract_svg_from_text, extract_json_from_text
 )
 
 # Import prompt analyzer
-from llm_integration.llm_prompt_analyzer import (
-    PromptAnalyzer, default_prompt_analyzer, 
-    analyze_prompt, enhance_prompt
+from svg_prompt_analyzer.llm_integration.llm_prompt_analyzer import (
+    LLMPromptAnalyzer, get_default_prompt_analyzer, 
+    analyze_prompt, enhance_prompt, analyze
 )
 
-# Import CLIP evaluator for quality assessment
-from llm_integration.clip_evaluator import ClipEvaluator, ClipScore
+# Import CLIP evaluator for quality assessment if available
+try:
+    from svg_prompt_analyzer.llm_integration.clip_evaluator import ClipEvaluator
+    CLIP_AVAILABLE = True
+except ImportError:
+    CLIP_AVAILABLE = False
 
 # Configure logger
 logger = get_logger(__name__)
+
+# Get memory manager instance
+memory_manager = MemoryManager()
+hardware_manager = HardwareManager()
 
 # Type aliases
 SvgString = str
@@ -133,11 +144,37 @@ class SvgTemplateManager:
     Provides templates for common SVG structures to improve generation quality.
     """
     
-    def __init__(self):
-        """Initialize template manager."""
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls, *args, **kwargs):
+        """Implement singleton pattern for resource efficiency."""
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super(SvgTemplateManager, cls).__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
+    
+    def __init__(self, template_dir: Optional[str] = None):
+        """
+        Initialize template manager.
+        
+        Args:
+            template_dir: Optional directory containing custom templates
+        """
+        # Initialize only once (singleton pattern)
+        if hasattr(self, '_initialized') and self._initialized:
+            return
+            
         # Default templates
         self._templates = self._create_default_templates()
         self._lock = threading.RLock()
+        
+        # Load custom templates if provided
+        if template_dir:
+            self._load_custom_templates(template_dir)
+            
+        self._initialized = True
     
     def get_template(self, template_id: str) -> Optional[str]:
         """
@@ -173,6 +210,7 @@ class SvgTemplateManager:
         with self._lock:
             return list(self._templates.keys())
     
+    @memory_manager.memory_efficient_function
     def get_template_for_prompt(self, prompt: str) -> Tuple[str, str]:
         """
         Find suitable template for a prompt.
@@ -184,23 +222,57 @@ class SvgTemplateManager:
             Tuple of (template_id, template)
         """
         # Analyze prompt to determine best template
-        analysis = analyze_prompt(prompt)
-        
-        # Scene templates
-        if analysis.category and analysis.category.name == "SCENE":
-            return "scene", self._templates["scene"]
+        try:
+            prompt_analysis = analyze(prompt)
             
-        # Icon templates
-        if "icon" in prompt.lower():
-            return "icon", self._templates["icon"]
-            
-        # Chart templates
-        chart_keywords = ["chart", "graph", "plot", "diagram"]
-        if any(keyword in prompt.lower() for keyword in chart_keywords):
-            return "chart", self._templates["chart"]
+            # Scene templates
+            if prompt_analysis.category and prompt_analysis.category.name == "SCENE":
+                return "scene", self._templates["scene"]
+                
+            # Icon templates
+            if "icon" in prompt.lower():
+                return "icon", self._templates["icon"]
+                
+            # Chart templates
+            chart_keywords = ["chart", "graph", "plot", "diagram"]
+            if any(keyword in prompt.lower() for keyword in chart_keywords):
+                return "chart", self._templates["chart"]
+        except Exception as e:
+            logger.warning(f"Error determining template for prompt: {e}")
             
         # Default to basic template
         return "basic", self._templates["basic"]
+    
+    def _load_custom_templates(self, template_dir: str) -> None:
+        """
+        Load custom templates from a directory.
+        
+        Args:
+            template_dir: Directory containing templates
+        """
+        try:
+            template_path = Path(template_dir)
+            if not template_path.exists():
+                logger.warning(f"Template directory does not exist: {template_dir}")
+                return
+                
+            # Load all .svg and .template files
+            for file_path in template_path.glob("*.svg"):
+                template_id = file_path.stem
+                with open(file_path, "r", encoding="utf-8") as f:
+                    template = f.read()
+                    self.add_template(template_id, template)
+                    
+            for file_path in template_path.glob("*.template"):
+                template_id = file_path.stem
+                with open(file_path, "r", encoding="utf-8") as f:
+                    template = f.read()
+                    self.add_template(template_id, template)
+                    
+            logger.info(f"Loaded custom templates from {template_dir}")
+            
+        except Exception as e:
+            logger.error(f"Error loading custom templates: {e}")
     
     def _create_default_templates(self) -> Dict[str, str]:
         """
@@ -392,10 +464,15 @@ class SvgProcessor:
             svg_content = svg_content.rstrip() + '</svg>'
             
         # 3. Fix malformed attributes (quotes)
-        svg_content = re.sub(r'=([^"\'][^\s>]*)', r'="\1"', svg_content)
+        svg_content = re.sub(pattern=r'=([^"\'][^\s>]*)', repl=r'="\1"', string=svg_content)
         
+        # 4. Make sure there's a root SVG element
+        if not svg_content.strip().startswith('<svg'):
+            svg_content = f'<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600">\n{svg_content}\n</svg>'
+            
         return svg_content
     
+    @memory_manager.memory_efficient_function
     def optimize_svg(self, svg_content: str) -> str:
         """
         Optimize SVG content.
@@ -407,25 +484,26 @@ class SvgProcessor:
             Optimized SVG content
         """
         try:
-            # Parse SVG
-            dom = minidom.parseString(svg_content)
-            
-            # Remove unnecessary attributes
-            self._remove_unnecessary_attributes(dom)
-            
-            # Round numeric values
-            self._round_numeric_attributes(dom)
-            
-            # Convert back to string
-            optimized = dom.toxml()
-            
-            # Remove XML declaration
-            optimized = re.sub(r'<\?xml[^>]*\?>\s*', '', optimized)
-            
-            # Remove empty lines
-            optimized = re.sub(r'\n\s*\n', '\n', optimized)
-            
-            return optimized
+            with Profiler("svg_optimization"):
+                # Parse SVG
+                dom = minidom.parseString(svg_content)
+                
+                # Remove unnecessary attributes
+                self._remove_unnecessary_attributes(dom)
+                
+                # Round numeric values
+                self._round_numeric_attributes(dom)
+                
+                # Convert back to string
+                optimized = dom.toxml()
+                
+                # Remove XML declaration
+                optimized = re.sub(r'<\?xml[^>]*\?>\s*', '', optimized)
+                
+                # Remove empty lines
+                optimized = re.sub(r'\n\s*\n', '\n', optimized)
+                
+                return optimized
             
         except Exception as e:
             logger.warning(f"Failed to optimize SVG: {e}")
@@ -460,6 +538,7 @@ class SvgProcessor:
             logger.warning(f"Failed to prettify SVG: {e}")
             return svg_content
     
+    @memory_manager.memory_efficient_function
     def calculate_metrics(self, svg_content: str) -> Dict[str, Any]:
         """
         Calculate metrics for SVG content.
@@ -649,9 +728,11 @@ class SvgGenerator:
     def __init__(
         self,
         llm_manager: Optional[LLMManager] = None,
-        prompt_analyzer: Optional[PromptAnalyzer] = None,
+        prompt_analyzer: Optional[LLMPromptAnalyzer] = None,
         clip_evaluator: Optional[ClipEvaluator] = None,
-        template_manager: Optional[SvgTemplateManager] = None
+        template_manager: Optional[SvgTemplateManager] = None,
+        batch_size: int = 4,
+        preload_models: bool = False
     ):
         """
         Initialize SVG generator.
@@ -661,20 +742,82 @@ class SvgGenerator:
             prompt_analyzer: Prompt analyzer for enhancement
             clip_evaluator: CLIP evaluator for quality assessment
             template_manager: Template manager for SVG templates
+            batch_size: Batch size for parallel processing
+            preload_models: Whether to preload models at initialization
         """
         # Set up components
-        self.llm_manager = llm_manager or default_llm_manager
-        self.prompt_analyzer = prompt_analyzer or default_prompt_analyzer
-        self.clip_evaluator = clip_evaluator  # Can be None
+        self.llm_manager = llm_manager or LLMManager()
+        self.prompt_analyzer = prompt_analyzer or get_default_prompt_analyzer()
+        
+        # Set up CLIP evaluator if available
+        self.clip_evaluator = None
+        if clip_evaluator:
+            self.clip_evaluator = clip_evaluator
+        elif CLIP_AVAILABLE:
+            try:
+                from svg_prompt_analyzer.llm_integration.clip_evaluator import ClipEvaluator
+                self.clip_evaluator = ClipEvaluator()
+            except Exception as e:
+                logger.warning(f"Failed to initialize CLIP evaluator: {e}")
+                
         self.template_manager = template_manager or SvgTemplateManager()
         
         # Set up processor
         self.processor = SvgProcessor()
         
+        # Get optimal configuration based on hardware
+        optimal_device = hardware_manager.get_optimal_device()
+        device_memory = hardware_manager.get_device_memory_stats()
+        
+        # Adjust batch size based on available memory
+        if optimal_device == "cuda" and "allocated" in device_memory:
+            # Limit batch size if GPU memory is constrained
+            total_mem = sum([m for m in device_memory["total"].values()])
+            used_mem = sum([m for m in device_memory["allocated"].values()])
+            if used_mem / total_mem > 0.5:  # More than 50% used
+                batch_size = min(batch_size, 4)
+                logger.info(f"Limiting batch size to {batch_size} due to GPU memory usage")
+        
+        self.batch_size = batch_size
+        
+        # Batch processor for parallel generation
+        self.batch_processor = BatchProcessor(
+            process_func=self._process_generation_batch,
+            optimal_batch_size=self.batch_size,
+            max_batch_size=self.batch_size * 2,
+            min_batch_size=1,
+            adaptive_batching=True,
+            memory_manager=memory_manager,
+            prefetch_next_batch=True
+        )
+        self.batch_processor.start()
+        
         # Cache for generated SVGs
         self._cache = {}
+        self._cache_lock = threading.RLock()
+        self._cache_size = 200  # Maximum number of cached SVGs
+        
+        # Preload models if requested
+        if preload_models:
+            self._preload_models()
+            
+        logger.info(f"SVG Generator initialized with batch_size={batch_size} on {optimal_device}")
+    
+    def _preload_models(self) -> None:
+        """Preload models for faster first inference."""
+        try:
+            # Preload LLM model for generation
+            self.llm_manager.load_model("svg_generator")
+            
+            # Preload CLIP model if available
+            if self.clip_evaluator:
+                self.clip_evaluator.load_model()
+                
+        except Exception as e:
+            logger.warning(f"Error preloading models: {e}")
     
     @log_function_call()
+    @memory_manager.memory_efficient_function
     def generate_svg(
         self,
         prompt: str,
@@ -703,32 +846,35 @@ class SvgGenerator:
         
         # Check cache if enabled
         cache_key = self._create_cache_key(prompt, config)
-        if cache_key in self._cache:
-            cached = self._cache[cache_key]
-            
-            # Add caching info
-            cached.generation_time = 0.0  # Reset time for cache hit
-            
-            # Deep copy to avoid modifying cached result
-            logger.info(f"Using cached SVG for prompt: {prompt[:50]}...")
-            return self._copy_result(cached)
+        with self._cache_lock:
+            if cache_key in self._cache:
+                cached = self._cache[cache_key]
+                
+                # Add caching info
+                cached.generation_time = 0.0  # Reset time for cache hit
+                
+                logger.info(f"Using cached SVG for prompt: {prompt[:50]}...")
+                
+                # Deep copy to avoid modifying cached result
+                return self._copy_result(cached)
             
         try:
             with Profiler("svg_generation"):
                 # Analyze and enhance prompt
-                prompt_analysis = self.prompt_analyzer.analyze(prompt)
-                
+                if config.enhance_prompt:
+                    try:
+                        enhanced_prompt = self.prompt_analyzer.enhance_prompt(prompt)
+                        result.enhanced_prompt = enhanced_prompt
+                        generation_prompt = enhanced_prompt
+                    except Exception as e:
+                        logger.warning(f"Error enhancing prompt: {e}")
+                        generation_prompt = prompt
+                else:
+                    generation_prompt = prompt
+                    
                 # Report progress if callback provided
                 if config.progress_callback:
                     config.progress_callback("prompt_analyzed", 0.1)
-                    
-                # Use enhanced prompt if enabled
-                if config.enhance_prompt:
-                    enhanced_prompt = prompt_analysis.enhanced_prompt or self.prompt_analyzer.enhance_prompt(prompt)
-                    result.enhanced_prompt = enhanced_prompt
-                    generation_prompt = enhanced_prompt
-                else:
-                    generation_prompt = prompt
                     
                 # Generate SVG
                 svg_content = None
@@ -749,6 +895,8 @@ class SvgGenerator:
                             svg_content = self._generate_with_components(generation_prompt, config)
                         elif config.strategy == GenerationStrategy.ITERATIVE:
                             svg_content = self._generate_iterative(generation_prompt, config)
+                        elif config.strategy == GenerationStrategy.OPTIMIZED:
+                            svg_content = self._generate_optimized(generation_prompt, config)
                         else:
                             # Default to direct generation
                             svg_content = self._generate_direct(generation_prompt, config)
@@ -774,13 +922,18 @@ class SvgGenerator:
                             
                         # Evaluate quality if CLIP is available
                         if config.use_clip_feedback and self.clip_evaluator:
-                            quality_score = self.clip_evaluator.evaluate_svg(generation_prompt, svg_content)
-                            
-                            # Retry if below quality threshold
-                            if quality_score < config.min_quality_score and retry_count < config.max_retries:
-                                logger.info(f"Quality score {quality_score} below threshold, retrying...")
-                                retry_count += 1
-                                continue
+                            try:
+                                quality_score = self.clip_evaluator.compute_similarity(svg_content, generation_prompt)
+                                
+                                # Retry if below quality threshold
+                                if quality_score < config.min_quality_score and retry_count < config.max_retries:
+                                    logger.info(f"Quality score {quality_score} below threshold, retrying...")
+                                    retry_count += 1
+                                    continue
+                            except Exception as clip_error:
+                                logger.warning(f"CLIP evaluation failed: {clip_error}")
+                                # Continue without CLIP evaluation
+                                quality_score = 0.8  # Assume decent quality
                         else:
                             # Without CLIP, assume good quality
                             quality_score = 0.8
@@ -811,7 +964,8 @@ class SvgGenerator:
                 result.element_count = metrics["element_count"]
                 
                 # Cache result
-                self._cache[cache_key] = self._copy_result(result)
+                with self._cache_lock:
+                    self._cache_result(cache_key, result)
                 
         except Exception as e:
             logger.error(f"SVG generation failed: {str(e)}")
@@ -824,6 +978,9 @@ class SvgGenerator:
         # Final progress update
         if config.progress_callback:
             config.progress_callback("completed", 1.0)
+            
+        # Memory checkpoint
+        memory_manager.operation_checkpoint()
             
         return result
     
@@ -843,14 +1000,137 @@ class SvgGenerator:
         Returns:
             List of generation results
         """
-        results = []
-        
-        for prompt in prompts:
-            results.append(self.generate_svg(prompt, config))
+        if not prompts:
+            return []
             
+        # Use default config if not provided
+        config = config or GenerationConfig()
+        
+        logger.info(f"Generating batch of {len(prompts)} SVGs")
+        
+        # Check cache for each prompt
+        results = []
+        prompts_to_generate = []
+        
+        for i, prompt in enumerate(prompts):
+            cache_key = self._create_cache_key(prompt, config)
+            with self._cache_lock:
+                if cache_key in self._cache:
+                    # Use cached result
+                    cached = self._cache[cache_key]
+                    cached.generation_time = 0.0  # Reset time for cache hit
+                    results.append((i, self._copy_result(cached)))
+                    continue
+            
+            # Add to list of prompts to generate
+            prompts_to_generate.append((i, prompt))
+        
+        if not prompts_to_generate:
+            # All results were cached
+            sorted_results = sorted(results, key=lambda x: x[0])
+            return [result for _, result in sorted_results]
+        
+        try:
+            with Profiler("batch_svg_generation"):
+                # Add tasks to batch processor
+                batch_results = {}
+                
+                for i, prompt in prompts_to_generate:
+                    # Create an ID for this task
+                    task_id = f"task_{i}_{hashlib.md5(prompt.encode()).hexdigest()[:8]}"
+                    self.batch_processor.add_item(task_id, (prompt, config))
+                    
+                # Collect results
+                timeout_per_prompt = 30.0  # 30 seconds per prompt
+                total_timeout = max(60.0, len(prompts_to_generate) * timeout_per_prompt)
+                
+                # Wait for all results with timeout
+                start_time = time.time()
+                task_ids = [f"task_{i}_{hashlib.md5(prompt.encode()).hexdigest()[:8]}" for i, prompt in prompts_to_generate]
+                
+                while len(batch_results) < len(prompts_to_generate):
+                    # Check timeout
+                    if time.time() - start_time > total_timeout:
+                        logger.warning("Batch processing timeout reached")
+                        break
+                    
+                    # Process completed items
+                    for task_id, (i, prompt) in zip(task_ids, prompts_to_generate):
+                        if i not in batch_results:
+                            result = self.batch_processor.get_result(task_id, timeout=0.1)
+                            if result:
+                                batch_results[i] = result
+                    
+                    # Short sleep to prevent CPU spinning
+                    time.sleep(0.1)
+                
+                # Process any remaining items sequentially
+                for i, prompt in prompts_to_generate:
+                    if i not in batch_results:
+                        try:
+                            # Generate directly
+                            result = self.generate_svg(prompt, config)
+                            batch_results[i] = result
+                        except Exception as e:
+                            logger.error(f"Error generating SVG for prompt {i}: {str(e)}")
+                            # Add failed result
+                            result = SvgGenerationResult(
+                                original_prompt=prompt,
+                                success=False,
+                                error_message=str(e)
+                            )
+                            batch_results[i] = result
+                
+                # Add batch results
+                for i, result in batch_results.items():
+                    results.append((i, result))
+                
+                # Sort results by original order
+                sorted_results = sorted(results, key=lambda x: x[0])
+                return [result for _, result in sorted_results]
+                
+        except Exception as e:
+            logger.error(f"Batch generation failed: {str(e)}")
+            
+            # Fall back to sequential generation
+            for i, prompt in prompts_to_generate:
+                try:
+                    result = self.generate_svg(prompt, config)
+                    results.append((i, result))
+                except Exception as err:
+                    logger.error(f"Error generating SVG for prompt {i}: {str(err)}")
+                    # Add failed result
+                    result = SvgGenerationResult(
+                        original_prompt=prompt,
+                        success=False,
+                        error_message=str(err)
+                    )
+                    results.append((i, result))
+            
+            # Sort results by original order
+            sorted_results = sorted(results, key=lambda x: x[0])
+            return [result for _, result in sorted_results]
+    
+    def _process_generation_batch(self, items: List[Tuple[str, GenerationConfig]]) -> List[SvgGenerationResult]:
+        """Process a batch of prompts for the batch processor."""
+        results = []
+        for prompt, config in items:
+            try:
+                result = self.generate_svg(prompt, config)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Error in batch item processing: {str(e)}")
+                # Add failed result
+                result = SvgGenerationResult(
+                    original_prompt=prompt,
+                    success=False,
+                    error_message=str(e)
+                )
+                results.append(result)
         return results
     
     @log_function_call()
+    @memory_manager.memory_efficient_function
     def refine_svg(
         self,
         svg_content: str,
@@ -909,15 +1189,16 @@ class SvgGenerator:
                 ]
                 
                 # Generate refined SVG
-                response = self.llm_manager.complete_sync(
-                    messages,
+                response = self.llm_manager.generate(
+                    role="svg_generator",
+                    prompt=messages,
                     model_type=config.model_type,
                     temperature=config.temperature,
                     max_tokens=config.max_tokens
                 )
                 
                 # Extract SVG from response
-                refined_svg = extract_svg_from_text(response.get("content", ""))
+                refined_svg = extract_svg_from_text(response)
                 
                 if not refined_svg:
                     raise ValueError("Failed to extract SVG from model response")
@@ -954,6 +1235,9 @@ class SvgGenerator:
             
         # Add timing information
         result.generation_time = time.time() - start_time
+        
+        # Memory checkpoint
+        memory_manager.operation_checkpoint()
         
         return result
     
@@ -1000,15 +1284,16 @@ class SvgGenerator:
         ]
         
         # Generate SVG
-        response = self.llm_manager.complete_sync(
-            messages,
+        response = self.llm_manager.generate(
+            role="svg_generator",
+            prompt=messages,
             model_type=config.model_type,
             temperature=config.temperature,
             max_tokens=config.max_tokens
         )
         
         # Extract SVG from response
-        svg_content = extract_svg_from_text(response.get("content", ""))
+        svg_content = extract_svg_from_text(response)
         
         if not svg_content:
             raise ValueError("Failed to extract SVG from model response")
@@ -1070,15 +1355,16 @@ class SvgGenerator:
         ]
         
         # Generate SVG
-        response = self.llm_manager.complete_sync(
-            messages,
+        response = self.llm_manager.generate(
+            role="svg_generator",
+            prompt=messages,
             model_type=config.model_type,
             temperature=config.temperature,
             max_tokens=config.max_tokens
         )
         
         # Extract SVG from response
-        svg_content = extract_svg_from_text(response.get("content", ""))
+        svg_content = extract_svg_from_text(response)
         
         if not svg_content:
             raise ValueError("Failed to extract SVG from model response")
@@ -1102,7 +1388,7 @@ class SvgGenerator:
         # First, get a structured representation of the prompt
         structured_prompt = self.prompt_analyzer.get_structured_prompt(prompt)
         
-        # Prepare the system prompt
+        # Prepare the system prompt for component generation
         system_prompt = """You are an expert SVG component designer. You will be given a structured prompt and asked to create 
         specific SVG components. Create clean, semantic SVG code for each component.
         Your response should be a JSON object containing the SVG code for each component."""
@@ -1137,15 +1423,16 @@ class SvgGenerator:
         ]
         
         # Generate components
-        component_response = self.llm_manager.complete_sync(
-            component_messages,
+        component_response = self.llm_manager.generate(
+            role="svg_generator",
+            prompt=component_messages,
             model_type=config.model_type,
             temperature=config.temperature,
             max_tokens=config.max_tokens
         )
         
         # Extract JSON data
-        components_data = extract_json_from_text(component_response.get("content", ""))
+        components_data = extract_json_from_text(component_response)
         
         if not components_data:
             raise ValueError("Failed to extract component data from model response")
@@ -1155,17 +1442,23 @@ class SvgGenerator:
         into a single cohesive SVG image. Create clean, semantic SVG code that incorporates all components.
         Your response should contain ONLY the complete SVG code, no explanations."""
         
+        # Prepare components for assembly
+        background = components_data.get('background', '<!-- No background -->')
+        elements = components_data.get('elements', [])
+        
+        # Create element string
+        element_str = "\n\n".join([f"```svg\n{element}\n```" for element in elements])
+        
         # Prepare user prompt for assembly
         assembly_user_prompt = f"""Combine these SVG components into a single SVG image:
         
         Background:
         ```svg
-        {components_data.get('background', '<!-- No background -->')}
+        {background}
         ```
         
         Elements:
-        {'''
-        '''.join([f'```svg\n{element}\n```' for element in components_data.get('elements', [])])}
+        {element_str}
         
         Requirements:
         - Final size: {config.width}x{config.height} pixels
@@ -1183,15 +1476,16 @@ class SvgGenerator:
         ]
         
         # Generate assembled SVG
-        assembly_response = self.llm_manager.complete_sync(
-            assembly_messages,
+        assembly_response = self.llm_manager.generate(
+            role="svg_generator",
+            prompt=assembly_messages,
             model_type=config.model_type,
             temperature=config.temperature,
             max_tokens=config.max_tokens
         )
         
         # Extract SVG from response
-        svg_content = extract_svg_from_text(assembly_response.get("content", ""))
+        svg_content = extract_svg_from_text(assembly_response)
         
         if not svg_content:
             raise ValueError("Failed to extract assembled SVG from model response")
@@ -1233,7 +1527,7 @@ class SvgGenerator:
         Your response should contain ONLY the refined SVG code, no explanations."""
         
         # Analyze the prompt for enhancement guidance
-        analysis = self.prompt_analyzer.analyze(prompt)
+        prompt_analysis = analyze(prompt)
         
         # Create refinement instructions
         refinement_instructions = "Refine this SVG to better match the prompt by:\n"
@@ -1243,16 +1537,16 @@ class SvgGenerator:
         refinement_instructions += "- Enhancing color usage and gradients where appropriate\n"
         
         # Add style-specific instructions
-        if analysis.style_cues:
-            refinement_instructions += f"- Emphasizing these styles: {', '.join(analysis.style_cues)}\n"
+        if prompt_analysis.style_cues:
+            refinement_instructions += f"- Emphasizing these styles: {', '.join(prompt_analysis.style_cues)}\n"
             
         # Add object-specific instructions
-        if analysis.objects:
-            refinement_instructions += f"- Ensuring these elements are well-represented: {', '.join(analysis.objects)}\n"
+        if prompt_analysis.objects:
+            refinement_instructions += f"- Ensuring these elements are well-represented: {', '.join(prompt_analysis.objects)}\n"
             
         # Add color-specific instructions
-        if analysis.colors:
-            refinement_instructions += f"- Using these colors effectively: {', '.join(analysis.colors)}\n"
+        if prompt_analysis.colors:
+            refinement_instructions += f"- Using these colors effectively: {', '.join(prompt_analysis.colors)}\n"
             
         # Prepare user prompt for refinement
         refine_user_prompt = f"""Refine this initial SVG to better match the prompt:
@@ -1276,15 +1570,16 @@ class SvgGenerator:
         ]
         
         # Generate refined SVG
-        refine_response = self.llm_manager.complete_sync(
-            refine_messages,
+        refine_response = self.llm_manager.generate(
+            role="svg_generator",
+            prompt=refine_messages,
             model_type=config.model_type,
             temperature=config.temperature,
             max_tokens=config.max_tokens
         )
         
         # Extract SVG from response
-        refined_svg = extract_svg_from_text(refine_response.get("content", ""))
+        refined_svg = extract_svg_from_text(refine_response)
         
         if not refined_svg:
             # Fall back to initial SVG
@@ -1292,6 +1587,69 @@ class SvgGenerator:
             return basic_svg
             
         return refined_svg
+    
+    def _generate_optimized(self, prompt: str, config: GenerationConfig) -> SvgString:
+        """
+        Generate SVG optimized for small file size.
+        
+        Args:
+            prompt: Generation prompt
+            config: Generation configuration
+            
+        Returns:
+            Generated SVG content
+            
+        Raises:
+            Exception: If generation fails
+        """
+        # Prepare the system prompt for optimized generation
+        system_prompt = """You are an expert SVG designer specializing in minimal, optimized SVGs.
+        Generate a compact, clean SVG that represents the prompt accurately with minimal file size.
+        Focus on simplicity, efficient paths, and minimal attributes.
+        Your response should contain ONLY the SVG code, no explanations."""
+        
+        # Prepare user prompt
+        user_prompt = f"""Create a highly optimized, minimal-size SVG based on this description:
+        
+        {prompt}
+        
+        Optimization requirements:
+        - Size: {config.width}x{config.height} pixels
+        - Minimize the number of elements
+        - Use compact path data (avoid unnecessary precision)
+        - Eliminate redundant attributes
+        - Merge shapes where possible
+        - Use efficient techniques (paths instead of multiple shapes)
+        - Avoid unnecessary groups
+        - Limit color variations
+        
+        Return ONLY the optimized SVG code with no explanations."""
+        
+        # Create messages
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        # Generate SVG
+        response = self.llm_manager.generate(
+            role="svg_generator",
+            prompt=messages,
+            model_type=config.model_type,
+            temperature=config.temperature,
+            max_tokens=config.max_tokens
+        )
+        
+        # Extract SVG from response
+        svg_content = extract_svg_from_text(response)
+        
+        if not svg_content:
+            raise ValueError("Failed to extract SVG from model response")
+        
+        # Extra optimization pass for file size
+        svg_content = self.processor.optimize_svg(svg_content)
+            
+        return svg_content
     
     def _create_cache_key(self, prompt: str, config: GenerationConfig) -> str:
         """
@@ -1321,6 +1679,23 @@ class SvgGenerator:
         key_str = "|".join(key_parts)
         return hashlib.md5(key_str.encode()).hexdigest()
     
+    def _cache_result(self, key: str, result: SvgGenerationResult) -> None:
+        """
+        Cache a generation result.
+        
+        Args:
+            key: Cache key
+            result: Result to cache
+        """
+        # Check cache size
+        if len(self._cache) >= self._cache_size:
+            # Remove oldest entry (arbitrary but consistent)
+            oldest_key = next(iter(self._cache))
+            del self._cache[oldest_key]
+            
+        # Add to cache
+        self._cache[key] = result
+    
     @staticmethod
     def _copy_result(result: SvgGenerationResult) -> SvgGenerationResult:
         """
@@ -1345,10 +1720,29 @@ class SvgGenerator:
             success=result.success,
             error_message=result.error_message
         )
+    
+    def shutdown(self) -> None:
+        """Clean up resources when done."""
+        logger.info("Shutting down SVG Generator")
+        
+        # Stop batch processor
+        if hasattr(self, 'batch_processor'):
+            self.batch_processor.stop(wait_complete=True)
+            
+        # Clear cache
+        with self._cache_lock:
+            self._cache.clear()
 
 
 # Create singleton instance for easy import
-default_svg_generator = SvgGenerator()
+_default_svg_generator = None
+
+def get_default_svg_generator() -> SvgGenerator:
+    """Get default SVG generator instance."""
+    global _default_svg_generator
+    if _default_svg_generator is None:
+        _default_svg_generator = SvgGenerator()
+    return _default_svg_generator
 
 
 # Utility functions
@@ -1370,7 +1764,7 @@ def generate_svg(prompt: str, **kwargs) -> SvgGenerationResult:
         if hasattr(config, key):
             setattr(config, key, value)
             
-    return default_svg_generator.generate_svg(prompt, config)
+    return get_default_svg_generator().generate_svg(prompt, config)
 
 
 def refine_svg(svg_content: str, refinement_prompt: str, **kwargs) -> SvgGenerationResult:
@@ -1392,7 +1786,7 @@ def refine_svg(svg_content: str, refinement_prompt: str, **kwargs) -> SvgGenerat
         if hasattr(config, key):
             setattr(config, key, value)
             
-    return default_svg_generator.refine_svg(svg_content, refinement_prompt, config)
+    return get_default_svg_generator().refine_svg(svg_content, refinement_prompt, config)
 
 
 def svg_to_png(svg_content: str, width: int = 800, height: int = 600) -> bytes:
