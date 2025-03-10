@@ -16,6 +16,12 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Union
 from datetime import datetime
 
+# Import core optimizations
+from svg_prompt_analyzer.core import CONFIG, memoize, Profiler, get_thread_pool
+from svg_prompt_analyzer.core.memory_manager import MemoryManager
+from svg_prompt_analyzer.core.batch_processor import BatchProcessor
+from svg_prompt_analyzer.core.core_module_integration import get_core_manager
+
 from svg_prompt_analyzer.main import SVGPromptAnalyzerApp
 from svg_prompt_analyzer.llm_integration.llm_manager import LLMManager
 from svg_prompt_analyzer.llm_integration.llm_prompt_analyzer import LLMPromptAnalyzer
@@ -25,6 +31,9 @@ from svg_prompt_analyzer.llm_integration.rl_optimizer import RLOptimizer
 from svg_prompt_analyzer.utils.logger import setup_logger
 
 logger = logging.getLogger(__name__)
+
+# Get memory manager singleton
+memory_manager = MemoryManager()
 
 
 class LLMEnhancedSVGApp:
@@ -72,8 +81,11 @@ class LLMEnhancedSVGApp:
         self.memory_efficient = memory_efficient
         self.enable_fallback = enable_fallback
         
-        # Load configuration
-        self.config = self._load_config(config_file) if config_file else self._get_default_config()
+        # Initialize core manager
+        self.core_manager = get_core_manager(config_file)
+        
+        # Load configuration from core manager
+        self.config = self.core_manager.config
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
@@ -81,17 +93,20 @@ class LLMEnhancedSVGApp:
         # Initialize standard app (used as fallback if needed)
         self.standard_app = SVGPromptAnalyzerApp(input_file, output_dir, batch_size) if enable_fallback else None
         
-        # Configure LLM Manager
+        # Get optimized model config from hardware manager
         llm_config = self.config.get("llm", {})
+        model_config = self.core_manager.optimize_model_config(llm_config)
+        
+        # Configure LLM Manager with optimized settings
         self.llm_manager = LLMManager(
             models_config={
-                "prompt_analyzer": llm_config.get("prompt_analyzer_model", "mistralai/Mistral-7B-Instruct-v0.2"),
-                "svg_generator": llm_config.get("svg_generator_model", "deepseek-ai/deepseek-coder-6.7b-instruct")
+                "prompt_analyzer": model_config.get("prompt_analyzer_model", "mistralai/Mistral-7B-Instruct-v0.2"),
+                "svg_generator": model_config.get("svg_generator_model", "deepseek-ai/deepseek-coder-6.7b-instruct")
             },
-            cache_dir=llm_config.get("cache_dir", ".cache/models"),
-            device=llm_config.get("device", "auto"),
-            use_8bit=llm_config.get("use_8bit", True),
-            use_4bit=llm_config.get("use_4bit", False)
+            cache_dir=model_config.get("cache_dir", ".cache/models"),
+            device=model_config.get("device", "auto"),
+            use_8bit=model_config.get("use_8bit", True),
+            use_4bit=model_config.get("use_4bit", False)
         )
         
         # Configure CLIP evaluator (only if optimization is enabled)
@@ -135,6 +150,18 @@ class LLMEnhancedSVGApp:
         else:
             self.optimizer = None
             
+        # Create batch processor for parallel task processing
+        self.batch_processor = self.core_manager.create_batch_processor(
+            name="svg_generation",
+            process_func=self._process_prompt_batch,
+            batch_config={
+                "optimal_batch_size": batch_size,
+                "max_batch_size": batch_size * 2,
+                "adaptive_batching": True,
+                "prefetch_next_batch": True
+            }
+        )
+            
         # Summary statistics
         self.stats = {
             "processed": 0,
@@ -146,6 +173,7 @@ class LLMEnhancedSVGApp:
             "clip_scores": []
         }
         
+    @memory_manager.memory_efficient_function
     def run(self) -> List[Dict[str, Any]]:
         """
         Run the SVG generation process for all prompts in the input file.
@@ -153,122 +181,86 @@ class LLMEnhancedSVGApp:
         Returns:
             List of result dictionaries for each processed prompt
         """
-        logger.info(f"Starting LLM-Enhanced SVG generation with input file: {self.input_file}")
-        
-        # Track timing
-        self.stats["start_time"] = datetime.now()
-        start_time = time.time()
-        
-        # Read prompts from input file
-        prompt_data = self._read_input_file()
-        
-        if not prompt_data:
-            logger.error(f"No valid prompts found in input file: {self.input_file}")
-            return []
+        with Profiler("llm_enhanced_svg_generation"):
+            logger.info(f"Starting LLM-Enhanced SVG generation with input file: {self.input_file}")
             
-        logger.info(f"Found {len(prompt_data)} prompts to process")
-        
-        # Initialize results list
-        results = []
-        
-        # Process prompts based on configuration
-        if self.parallel_processing and self.num_workers > 1:
-            # Parallel processing
-            results = self._process_parallel(prompt_data)
-        else:
-            # Sequential processing
-            results = self._process_sequential(prompt_data)
+            # Track timing
+            self.stats["start_time"] = datetime.now()
+            start_time = time.time()
             
-        # Update end time
-        self.stats["end_time"] = datetime.now()
-        total_time = time.time() - start_time
+            # Read prompts from input file
+            prompt_data = self._read_input_file()
+            
+            if not prompt_data:
+                logger.error(f"No valid prompts found in input file: {self.input_file}")
+                return []
+                
+            logger.info(f"Found {len(prompt_data)} prompts to process")
+            
+            # Initialize results list
+            results = []
+            
+            # Process prompts based on configuration
+            if self.parallel_processing and self.num_workers > 1:
+                # Use batch processor for parallel processing
+                for prompt_item in prompt_data:
+                    self.batch_processor.add_item(prompt_item["id"], prompt_item)
+                
+                # Wait for all results with a reasonable timeout
+                total_timeout = max(300, len(prompt_data) * 30)  # At least 30s per prompt
+                batch_results = self.batch_processor.get_results(timeout=total_timeout)
+                
+                # Convert to list format
+                results = list(batch_results.values())
+            else:
+                # Sequential processing with batches
+                for i in range(0, len(prompt_data), self.batch_size):
+                    batch = prompt_data[i:i + self.batch_size]
+                    
+                    logger.info(f"Processing batch {i // self.batch_size + 1}/{(len(prompt_data) + self.batch_size - 1) // self.batch_size} "
+                              f"({len(batch)} prompts)")
+                    
+                    batch_results = self._process_prompt_batch(batch)
+                    results.extend(batch_results)
+                    
+                    # Force garbage collection after each batch
+                    memory_manager.force_garbage_collection()
+                    
+            # Update end time
+            self.stats["end_time"] = datetime.now()
+            total_time = time.time() - start_time
+            
+            # Generate summary
+            summary = self._generate_summary(total_time)
+            
+            # Save summary
+            self._save_summary(summary)
+            
+            logger.info(f"Completed SVG generation for {len(prompt_data)} prompts "
+                      f"in {total_time:.2f}s ({self.stats['successful']} successful, "
+                      f"{self.stats['failed']} failed)")
+                      
+            return results
         
-        # Generate summary
-        summary = self._generate_summary(total_time)
-        
-        # Save summary
-        self._save_summary(summary)
-        
-        logger.info(f"Completed SVG generation for {len(prompt_data)} prompts "
-                   f"in {total_time:.2f}s ({self.stats['successful']} successful, "
-                   f"{self.stats['failed']} failed)")
-                   
-        return results
-        
-    def _process_sequential(self, prompt_data: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    def _process_prompt_batch(self, batch: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         """
-        Process prompts sequentially.
+        Process a batch of prompts.
         
         Args:
-            prompt_data: List of prompt dictionaries
+            batch: List of prompt dictionaries
             
         Returns:
             List of result dictionaries
         """
         results = []
         
-        # Process in batches to limit memory usage
-        for i in range(0, len(prompt_data), self.batch_size):
-            batch = prompt_data[i:i + self.batch_size]
+        for prompt_item in batch:
+            result = self._process_prompt(prompt_item)
+            results.append(result)
             
-            logger.info(f"Processing batch {i // self.batch_size + 1}/{(len(prompt_data) + self.batch_size - 1) // self.batch_size} "
-                       f"({len(batch)} prompts)")
-                       
-            for prompt_item in batch:
-                result = self._process_prompt(prompt_item)
-                results.append(result)
-                
-            # Release memory if needed
-            if self.memory_efficient:
-                self._cleanup_memory()
-                
         return results
         
-    def _process_parallel(self, prompt_data: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-        """
-        Process prompts in parallel using thread pool.
-        
-        Args:
-            prompt_data: List of prompt dictionaries
-            
-        Returns:
-            List of result dictionaries
-        """
-        results = [None] * len(prompt_data)  # Pre-allocate result list
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            # Submit all tasks
-            futures = {}
-            for i, prompt_item in enumerate(prompt_data):
-                future = executor.submit(self._process_prompt, prompt_item)
-                futures[future] = i
-                
-            # Process results as they complete
-            for i, (future, prompt_idx) in enumerate(concurrent.futures.as_completed(futures.keys())):
-                try:
-                    result = future.result()
-                    results[prompt_idx] = result
-                    
-                    # Log progress
-                    logger.info(f"Completed {i+1}/{len(prompt_data)} prompts "
-                               f"(ID: {result.get('id', 'unknown')})")
-                except Exception as e:
-                    prompt_id = prompt_data[prompt_idx].get("id", f"unknown_{prompt_idx}")
-                    logger.error(f"Error processing prompt {prompt_id}: {str(e)}")
-                    
-                    # Add error result
-                    results[prompt_idx] = {
-                        "id": prompt_id,
-                        "prompt": prompt_data[prompt_idx].get("description", ""),
-                        "error": str(e),
-                        "success": False
-                    }
-                    
-                    # Update statistics
-                    self.stats["failed"] += 1
-                
-        return [r for r in results if r is not None]
-        
+    @memory_manager.memory_efficient_function
     def _process_prompt(self, prompt_item: Dict[str, str]) -> Dict[str, Any]:
         """
         Process a single prompt through the full pipeline.
@@ -279,97 +271,99 @@ class LLMEnhancedSVGApp:
         Returns:
             Result dictionary
         """
-        prompt_id = prompt_item.get("id", "unknown")
-        prompt_text = prompt_item.get("description", "")
-        
-        logger.info(f"Processing prompt: {prompt_id} - '{prompt_text}'")
-        
-        try:
-            # Update statistics
-            self.stats["processed"] += 1
+        with Profiler(f"process_prompt_{prompt_item.get('id', 'unknown')}"):
+            prompt_id = prompt_item.get("id", "unknown")
+            prompt_text = prompt_item.get("description", "")
             
-            # 1. Use LLM to analyze the prompt and create a scene
-            logger.info(f"Analyzing prompt: {prompt_id}")
-            scene = self.prompt_analyzer.analyze_prompt(prompt_id, prompt_text)
+            logger.info(f"Processing prompt: {prompt_id} - '{prompt_text}'")
             
-            # 2. Generate SVG from the scene
-            logger.info(f"Generating SVG for prompt: {prompt_id}")
-            svg_path = self.svg_generator.save_svg(scene)
-            
-            # Read the generated SVG
-            with open(svg_path, 'r', encoding='utf-8') as f:
-                svg_code = f.read()
+            try:
+                # Update statistics
+                self.stats["processed"] += 1
                 
-            # 3. Optimize the SVG if requested
-            clip_score = None
-            if self.use_optimization:
-                logger.info(f"Optimizing SVG for prompt: {prompt_id}")
+                # 1. Use LLM to analyze the prompt and create a scene
+                logger.info(f"Analyzing prompt: {prompt_id}")
+                scene = self.prompt_analyzer.analyze_prompt(prompt_id, prompt_text)
                 
-                # Load CLIP evaluator if not already loaded
-                if not self.clip_evaluator.model_loaded:
-                    self.clip_evaluator.load_model()
+                # 2. Generate SVG from the scene
+                logger.info(f"Generating SVG for prompt: {prompt_id}")
+                svg_path = self.svg_generator.save_svg(scene)
+                
+                # Read the generated SVG
+                with open(svg_path, 'r', encoding='utf-8') as f:
+                    svg_code = f.read()
                     
-                # Optimize SVG
-                optimized_svg, clip_score = self.optimizer.optimize(
-                    scene=scene,
-                    base_svg=svg_code,
-                    optimization_level=self.optimization_level
-                )
-                
-                # Save optimized SVG if score improved
-                if clip_score > 0:
-                    optimized_path = os.path.join(self.output_dir, f"{prompt_id}_optimized.svg")
-                    with open(optimized_path, 'w', encoding='utf-8') as f:
-                        f.write(optimized_svg)
-                        
-                    # Update the main SVG with the optimized version
-                    with open(svg_path, 'w', encoding='utf-8') as f:
-                        f.write(optimized_svg)
-                        
-                    # Update statistics
-                    self.stats["optimized"] += 1
-                    self.stats["clip_scores"].append(clip_score)
+                # 3. Optimize the SVG if requested
+                clip_score = None
+                if self.use_optimization:
+                    logger.info(f"Optimizing SVG for prompt: {prompt_id}")
                     
-                    # Update SVG code for result
-                    svg_code = optimized_svg
-            
-            # 4. Evaluate final SVG similarity if CLIP is available
-            if clip_score is None and self.clip_evaluator and self.clip_evaluator.model_loaded:
-                clip_score = self.clip_evaluator.compute_similarity(svg_code, prompt_text)
-                if clip_score > 0:
-                    self.stats["clip_scores"].append(clip_score)
-            
-            # Update statistics
-            self.stats["successful"] += 1
-            
-            # Create result
-            result = {
-                "id": prompt_id,
-                "prompt": prompt_text,
-                "svg_path": svg_path,
-                "success": True
-            }
-            
-            # Add CLIP score if available
-            if clip_score is not None:
-                result["clip_score"] = clip_score
+                    # Load CLIP evaluator if not already loaded
+                    if not self.clip_evaluator.model_loaded:
+                        self.clip_evaluator.load_model()
+                        
+                    # Optimize SVG
+                    optimized_svg, clip_score = self.optimizer.optimize(
+                        scene=scene,
+                        base_svg=svg_code,
+                        optimization_level=self.optimization_level
+                    )
+                    
+                    # Save optimized SVG if score improved
+                    if clip_score > 0:
+                        optimized_path = os.path.join(self.output_dir, f"{prompt_id}_optimized.svg")
+                        with open(optimized_path, 'w', encoding='utf-8') as f:
+                            f.write(optimized_svg)
+                            
+                        # Update the main SVG with the optimized version
+                        with open(svg_path, 'w', encoding='utf-8') as f:
+                            f.write(optimized_svg)
+                            
+                        # Update statistics
+                        self.stats["optimized"] += 1
+                        self.stats["clip_scores"].append(clip_score)
+                        
+                        # Update SVG code for result
+                        svg_code = optimized_svg
                 
-            return result
+                # 4. Evaluate final SVG similarity if CLIP is available
+                if clip_score is None and self.clip_evaluator and self.clip_evaluator.model_loaded:
+                    clip_score = self.clip_evaluator.compute_similarity(svg_code, prompt_text)
+                    if clip_score > 0:
+                        self.stats["clip_scores"].append(clip_score)
+                
+                # Update statistics
+                self.stats["successful"] += 1
+                
+                # Create result
+                result = {
+                    "id": prompt_id,
+                    "prompt": prompt_text,
+                    "svg_path": svg_path,
+                    "success": True
+                }
+                
+                # Add CLIP score if available
+                if clip_score is not None:
+                    result["clip_score"] = clip_score
+                    
+                return result
+                
+            except Exception as e:
+                logger.error(f"Error processing prompt {prompt_id}: {str(e)}")
+                
+                # Update statistics
+                self.stats["failed"] += 1
+                
+                # Create error result
+                return {
+                    "id": prompt_id,
+                    "prompt": prompt_text,
+                    "error": str(e),
+                    "success": False
+                }
             
-        except Exception as e:
-            logger.error(f"Error processing prompt {prompt_id}: {str(e)}")
-            
-            # Update statistics
-            self.stats["failed"] += 1
-            
-            # Create error result
-            return {
-                "id": prompt_id,
-                "prompt": prompt_text,
-                "error": str(e),
-                "success": False
-            }
-            
+    @memoize
     def _read_input_file(self) -> List[Dict[str, str]]:
         """
         Read prompts from the input CSV file.
@@ -421,6 +415,9 @@ class LLMEnhancedSVGApp:
         max_clip_score = max(clip_scores) if clip_scores else None
         min_clip_score = min(clip_scores) if clip_scores else None
         
+        # Get resource statistics
+        resource_stats = self.core_manager.get_resource_stats()
+        
         # Create summary
         summary = {
             "total_prompts": processed,
@@ -438,8 +435,15 @@ class LLMEnhancedSVGApp:
                 "parallel_processing": self.parallel_processing,
                 "num_workers": self.num_workers if self.parallel_processing else 1,
                 "memory_efficient": self.memory_efficient,
-                "enable_fallback": self.enable_fallback
-            }
+                "enable_fallback": self.enable_fallback,
+                "device": self.core_manager.get_optimal_device()
+            },
+            "resources": {
+                "memory_usage": resource_stats.get("memory", {}),
+                "cpu_usage": resource_stats.get("cpu", {}),
+                "gpu_usage": resource_stats.get("gpu", {})
+            },
+            "recommendations": self.core_manager.get_resource_recommendations()
         }
         
         # Add optimization statistics if applicable
@@ -472,77 +476,20 @@ class LLMEnhancedSVGApp:
             
         except Exception as e:
             logger.error(f"Error saving summary: {str(e)}")
-            
-    def _cleanup_memory(self) -> None:
-        """Release memory in memory-efficient mode."""
-        if not self.memory_efficient:
-            return
-            
-        # Suggest garbage collection
-        import gc
-        gc.collect()
+    
+    def shutdown(self) -> None:
+        """Clean up resources when done."""
+        logger.info("Shutting down LLM Enhanced SVG App")
         
-        # Clear caches if available
-        if self.clip_evaluator and hasattr(self.clip_evaluator, 'clear_caches'):
-            self.clip_evaluator.clear_caches()
-            
-    def _load_config(self, config_file: str) -> Dict[str, Any]:
-        """
-        Load configuration from a JSON file.
+        # Stop batch processor
+        self.batch_processor.stop(wait_complete=True)
         
-        Args:
-            config_file: Path to configuration file
-            
-        Returns:
-            Configuration dictionary
-        """
-        try:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                
-            logger.info(f"Loaded configuration from {config_file}")
-            return config
-            
-        except Exception as e:
-            logger.error(f"Error loading configuration from {config_file}: {str(e)}")
-            return self._get_default_config()
-            
-    def _get_default_config(self) -> Dict[str, Any]:
-        """
-        Get default configuration.
+        # Shutdown core manager
+        self.core_manager.shutdown()
         
-        Returns:
-            Default configuration dictionary
-        """
-        return {
-            "llm": {
-                "prompt_analyzer_model": "mistralai/Mistral-7B-Instruct-v0.2",
-                "svg_generator_model": "deepseek-ai/deepseek-coder-6.7b-instruct",
-                "device": "auto",
-                "use_8bit": True,
-                "use_4bit": False,
-                "cache_dir": ".cache/models"
-            },
-            "clip": {
-                "model_name": "SigLIP-SoViT-400m",
-                "device": "auto",
-                "cache_dir": ".cache/clip"
-            },
-            "optimization": {
-                "max_iterations": [1, 2, 3],
-                "population_size": [3, 5, 8],
-                "exploration_rate": 0.3,
-                "hall_of_fame_dir": "hall_of_fame"
-            },
-            "fallback": {
-                "analyzer_threshold": 0.7,
-                "generator_threshold": 0.6
-            },
-            "system": {
-                "memory_efficient": False,
-                "max_svg_size": 9500
-            }
-        }
+        # Release model resources
+        if self.clip_evaluator:
+            self.clip_evaluator.close()
 
 
 # CLI entry point
@@ -604,8 +551,16 @@ def run_cli() -> None:
             
         print(f"\nOutput saved to: {os.path.abspath(app.output_dir)}")
         
+        # Clean up
+        app.shutdown()
+        
+    except KeyboardInterrupt:
+        print("\nOperation canceled by user")
+        app.shutdown()
     except Exception as e:
         logger.error(f"Error running application: {str(e)}")
+        app.shutdown()
+        import sys
         sys.exit(1)
 
 
