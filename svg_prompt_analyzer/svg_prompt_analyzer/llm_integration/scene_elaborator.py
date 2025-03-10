@@ -29,9 +29,7 @@ from svg_prompt_analyzer.llm_integration.llm_manager import LLMManager
 from svg_prompt_analyzer.models.scene import Scene
 from svg_prompt_analyzer.models.visual_object import VisualObject, ObjectType
 from svg_prompt_analyzer.models.color import Color
-from svg_prompt_analyzer.models.material import Material
 from svg_prompt_analyzer.models.shape import Shape, Attribute
-from svg_prompt_analyzer.models.spatial import SpatialRelation
 
 logger = logging.getLogger(__name__)
 

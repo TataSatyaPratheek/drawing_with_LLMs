@@ -1,5 +1,5 @@
 """
-PPO Optimizer Module - Enhanced
+PPO Optimizer Module
 ======================
 This module provides a full implementation of the Proximal Policy Optimization
 (PPO) algorithm for reinforcement learning optimization of SVG generation.
@@ -16,22 +16,28 @@ import threading
 import math
 import gc
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Tuple, Optional, Union, Callable
+from typing import Dict, Any, List, Tuple, Optional, Union, Callable, Iterator
 from pathlib import Path
 
 # Import core optimizations
-from svg_prompt_analyzer.core import CONFIG, memoize, jit, Profiler, get_thread_pool
+from svg_prompt_analyzer.core import CONFIG, memoize, jit, Profiler
 from svg_prompt_analyzer.core.batch_processor import BatchProcessor
 from svg_prompt_analyzer.core.memory_manager import MemoryManager
+from svg_prompt_analyzer.core.hardware_manager import HardwareManager
 
-from svg_prompt_analyzer.llm_integration.llm_manager import LLMManager
+# Import LLM manager and CLIP evaluator
+from svg_prompt_analyzer.llm_integration.llm_manager import LLMManager, extract_svg_from_text
 from svg_prompt_analyzer.llm_integration.clip_evaluator import CLIPEvaluator
+
+# Import models
 from svg_prompt_analyzer.models.scene import Scene
 
+# Configure logger
 logger = logging.getLogger(__name__)
 
-# Get memory manager instance
+# Get core component instances
 memory_manager = MemoryManager()
+hardware_manager = HardwareManager()
 
 
 @dataclass
@@ -59,24 +65,29 @@ class PPOBatch:
 
 
 @memoize
-def _load_torch():
+def _load_torch() -> Dict[str, Any]:
     """
     Lazily load PyTorch modules to reduce startup time and memory usage.
     Returns PyTorch modules as a dictionary.
     """
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    import torch.optim as optim
-    from torch.distributions import Categorical
-    
-    return {
-        'torch': torch,
-        'nn': nn,
-        'F': F,
-        'optim': optim,
-        'Categorical': Categorical
-    }
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        import torch.optim as optim
+        from torch.distributions import Categorical
+        
+        return {
+            'torch': torch,
+            'nn': nn,
+            'F': F,
+            'optim': optim,
+            'Categorical': Categorical,
+            'available': True
+        }
+    except ImportError as e:
+        logger.warning(f"PyTorch import error: {e}")
+        return {'available': False}
 
 
 class PolicyNetwork:
@@ -92,6 +103,9 @@ class PolicyNetwork:
             hidden_dim: Dimension of hidden layers
         """
         torch_modules = _load_torch()
+        if not torch_modules['available']:
+            raise ImportError("PyTorch is required for PolicyNetwork")
+            
         nn = torch_modules['nn']
         
         self.network = nn.Sequential(
@@ -128,6 +142,9 @@ class ValueNetwork:
             hidden_dim: Dimension of hidden layers
         """
         torch_modules = _load_torch()
+        if not torch_modules['available']:
+            raise ImportError("PyTorch is required for ValueNetwork")
+            
         nn = torch_modules['nn']
         
         self.network = nn.Sequential(
@@ -178,34 +195,247 @@ class FeatureExtractor:
         with Profiler("feature_extraction"):
             features = np.zeros(self.feature_dim)
             
-            # Extract basic features
-            features[0] = len(scene.objects)  # Number of objects
-            features[1] = len(svg_code) / 10000  # Normalized SVG size
+            try:
+                # Extract basic features
+                features[0] = len(scene.objects)  # Number of objects
+                features[1] = len(svg_code) / 10000  # Normalized SVG size
+                
+                # Extract color features
+                color_counts = {}
+                for obj in scene.objects:
+                    if hasattr(obj, 'color') and obj.color:
+                        color_name = obj.color.name
+                        color_counts[color_name] = color_counts.get(color_name, 0) + 1
+                
+                features[2] = len(color_counts)  # Number of unique colors
+                
+                # Extract spatial features
+                if scene.objects:
+                    if hasattr(scene.objects[0], 'position'):
+                        avg_x = sum(obj.position[0] for obj in scene.objects) / len(scene.objects)
+                        avg_y = sum(obj.position[1] for obj in scene.objects) / len(scene.objects)
+                        features[3] = avg_x
+                        features[4] = avg_y
+                
+                # Extract complexity features
+                features[5] = svg_code.count("<") / 100  # Number of tags
+                features[6] = svg_code.count("path") / 10  # Number of paths
+                
+                # Count common SVG features
+                features[7] = svg_code.count("<g") / 10  # Number of groups
+                features[8] = svg_code.count("<rect") / 10  # Number of rectangles
+                features[9] = svg_code.count("<circle") / 10  # Number of circles
+                
+                # Detect advanced SVG features
+                features[10] = 1.0 if "linear-gradient" in svg_code else 0.0
+                features[11] = 1.0 if "radial-gradient" in svg_code else 0.0
+                features[12] = 1.0 if "<filter" in svg_code else 0.0
+                features[13] = 1.0 if "<mask" in svg_code else 0.0
+                features[14] = 1.0 if "<clipPath" in svg_code else 0.0
+                
+                # Add prompt length as a feature
+                if hasattr(scene, 'prompt'):
+                    features[15] = len(scene.prompt) / 100  # Normalized prompt length
             
-            # Extract color features
-            color_counts = {}
-            for obj in scene.objects:
-                if obj.color:
-                    color_name = obj.color.name
-                    color_counts[color_name] = color_counts.get(color_name, 0) + 1
-            
-            features[2] = len(color_counts)  # Number of unique colors
-            
-            # Extract spatial features
-            if scene.objects:
-                avg_x = sum(obj.position[0] for obj in scene.objects) / len(scene.objects)
-                avg_y = sum(obj.position[1] for obj in scene.objects) / len(scene.objects)
-                features[3] = avg_x
-                features[4] = avg_y
-            
-            # Extract complexity features
-            features[5] = svg_code.count("<") / 100  # Number of tags
-            features[6] = svg_code.count("path") / 10  # Number of paths
-            
-            # Extract semantic features
-            # Complex semantic features would go here
-            
+            except Exception as e:
+                logger.warning(f"Error extracting features: {e}")
+                
             return features
+
+
+@dataclass
+class HallOfFameEntry:
+    """An entry in the Hall of Fame for successful SVGs."""
+    svg_code: str
+    score: float
+    params: Dict[str, Any]
+    prompt: str
+    timestamp: float = field(default_factory=time.time)
+
+
+class HallOfFame:
+    """Maintains a collection of the most successful SVGs for knowledge transfer."""
+    
+    def __init__(self, max_size: int = 20, storage_path: str = ".cache/hall_of_fame"):
+        """
+        Initialize the Hall of Fame.
+        
+        Args:
+            max_size: Maximum number of entries to keep
+            storage_path: Path to store entries
+        """
+        self.max_size = max_size
+        self.storage_path = storage_path
+        self.entries: List[HallOfFameEntry] = []
+        self._lock = threading.RLock()
+        
+        # Create storage directory
+        os.makedirs(storage_path, exist_ok=True)
+        
+        # Try to load existing entries
+        self._load_entries()
+    
+    def add_entry(self, svg_code: str, score: float, params: Dict[str, Any], prompt: str) -> bool:
+        """
+        Add a new entry to the Hall of Fame.
+        
+        Args:
+            svg_code: SVG code
+            score: CLIP similarity score
+            params: Generation parameters
+            prompt: Text prompt
+            
+        Returns:
+            True if entry was added, False if it wasn't good enough
+        """
+        with self._lock:
+            # Create new entry
+            entry = HallOfFameEntry(
+                svg_code=svg_code,
+                score=score,
+                params=params.copy(),
+                prompt=prompt,
+                timestamp=time.time()
+            )
+            
+            # Check if it's good enough to be added
+            if len(self.entries) < self.max_size:
+                self.entries.append(entry)
+                self.entries.sort(key=lambda x: x.score, reverse=True)
+                self._save_entries()
+                return True
+            elif score > self.entries[-1].score:
+                # Replace the worst entry
+                self.entries[-1] = entry
+                self.entries.sort(key=lambda x: x.score, reverse=True)
+                self._save_entries()
+                return True
+                
+            return False
+    
+    def get_best_entry(self, prompt: str = None) -> Optional[HallOfFameEntry]:
+        """
+        Get the best entry, optionally filtered by prompt similarity.
+        
+        Args:
+            prompt: Optional prompt to filter by
+            
+        Returns:
+            Best entry or None if no entries
+        """
+        with self._lock:
+            if not self.entries:
+                return None
+                
+            if prompt is None:
+                return self.entries[0]
+                
+            # Find entry with most similar prompt
+            # This is a simple implementation - in production we'd use
+            # sentence embeddings or other similarity measures
+            best_entry = None
+            best_similarity = -1
+            
+            for entry in self.entries:
+                # Simple word overlap similarity
+                prompt_words = set(prompt.lower().split())
+                entry_words = set(entry.prompt.lower().split())
+                similarity = len(prompt_words.intersection(entry_words)) / len(prompt_words.union(entry_words))
+                
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_entry = entry
+                    
+            return best_entry
+    
+    def get_random_entry(self) -> Optional[HallOfFameEntry]:
+        """
+        Get a random entry from the Hall of Fame.
+        
+        Returns:
+            Random entry or None if no entries
+        """
+        with self._lock:
+            if not self.entries:
+                return None
+                
+            return random.choice(self.entries)
+    
+    def get_entries(self, top_k: int = None) -> List[HallOfFameEntry]:
+        """
+        Get entries from the Hall of Fame.
+        
+        Args:
+            top_k: Number of top entries to get, or None for all
+            
+        Returns:
+            List of entries
+        """
+        with self._lock:
+            if top_k is None or top_k >= len(self.entries):
+                return self.entries.copy()
+                
+            return self.entries[:top_k]
+    
+    def _save_entries(self) -> None:
+        """Save entries to disk."""
+        try:
+            with self._lock:
+                # Save metadata
+                metadata = []
+                for i, entry in enumerate(self.entries):
+                    metadata.append({
+                        "score": entry.score,
+                        "params": entry.params,
+                        "prompt": entry.prompt,
+                        "timestamp": entry.timestamp,
+                        "filename": f"svg_{i}.svg"
+                    })
+                    
+                metadata_path = os.path.join(self.storage_path, "metadata.json")
+                with open(metadata_path, "w") as f:
+                    json.dump(metadata, f, indent=2)
+                    
+                # Save SVGs
+                for i, entry in enumerate(self.entries):
+                    svg_path = os.path.join(self.storage_path, f"svg_{i}.svg")
+                    with open(svg_path, "w") as f:
+                        f.write(entry.svg_code)
+        except Exception as e:
+            logger.error(f"Error saving Hall of Fame entries: {e}")
+    
+    def _load_entries(self) -> None:
+        """Load entries from disk."""
+        try:
+            metadata_path = os.path.join(self.storage_path, "metadata.json")
+            if not os.path.exists(metadata_path):
+                return
+                
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+                
+            entries = []
+            for entry_data in metadata:
+                svg_path = os.path.join(self.storage_path, entry_data.get("filename", ""))
+                if not os.path.exists(svg_path):
+                    continue
+                    
+                with open(svg_path, "r") as f:
+                    svg_code = f.read()
+                    
+                entry = HallOfFameEntry(
+                    svg_code=svg_code,
+                    score=entry_data.get("score", 0.0),
+                    params=entry_data.get("params", {}),
+                    prompt=entry_data.get("prompt", ""),
+                    timestamp=entry_data.get("timestamp", 0.0)
+                )
+                entries.append(entry)
+                
+            self.entries = sorted(entries, key=lambda x: x.score, reverse=True)
+            logger.info(f"Loaded {len(self.entries)} entries to Hall of Fame")
+        except Exception as e:
+            logger.error(f"Error loading Hall of Fame entries: {e}")
 
 
 class PPOOptimizer:
@@ -253,6 +483,11 @@ class PPOOptimizer:
         self.llm_manager = llm_manager or LLMManager()
         self.clip_evaluator = clip_evaluator or CLIPEvaluator()
         
+        # Check for PyTorch availability
+        torch_modules = _load_torch()
+        if not torch_modules['available']:
+            raise ImportError("PyTorch is required for PPOOptimizer")
+        
         # PPO parameters
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -265,18 +500,24 @@ class PPOOptimizer:
         self.max_grad_norm = max_grad_norm
         self.update_epochs = update_epochs
         
-        # Use memory manager to calculate optimal batch size if not specified
+        # Determine optimal batch size based on available memory and device
         if batch_size is None:
-            # Estimate 1MB per item (conservative)
+            # Estimate item memory (state + action + reward + next_state)
+            item_size_estimate = state_dim * 8 * 2 + 8 + 8  # ~bytes per item
+            model_size_estimate = state_dim * action_dim * hidden_dim * 4 * 2  # Rough size for both networks
+            
             self.batch_size = memory_manager.calculate_optimal_batch_size(
-                item_size_estimate=1024*1024,  # 1MB per sample
-                model_size_estimate=state_dim * action_dim * hidden_dim * 4 * 2  # Rough model size
+                item_size_estimate=item_size_estimate,
+                model_size_estimate=model_size_estimate,
+                target_device=device if device != "auto" else hardware_manager.get_optimal_device()
             )
+            logger.info(f"Calculated optimal batch size: {self.batch_size}")
         else:
             self.batch_size = batch_size
             
         # Determine device
         self.device = self._get_device(device)
+        logger.info(f"Using device: {self.device}")
         
         # Create cache directory
         self.cache_dir = cache_dir
@@ -294,11 +535,17 @@ class PPOOptimizer:
         # Batch processor for parallel experience collection
         self._experience_processor = BatchProcessor(
             process_func=self._process_experience_batch,
-            optimal_batch_size=self.batch_size
+            optimal_batch_size=min(8, self.batch_size),
+            max_batch_size=min(16, self.batch_size),
+            min_batch_size=1,
+            adaptive_batching=True,
+            memory_manager=memory_manager
         )
+        self._experience_processor.start()
         
         # Experience buffer
         self.experiences = []
+        self._experiences_lock = threading.Lock()
         
         # Initialize action mapping
         self.action_mapping = self._create_action_mapping()
@@ -314,6 +561,12 @@ class PPOOptimizer:
             "focus_keyword": (0, 15)  # Index of keyword to focus on
         }
         
+        # Hall of Fame for successful SVGs
+        self.hall_of_fame = HallOfFame(
+            max_size=20,
+            storage_path=os.path.join(cache_dir, "hall_of_fame")
+        )
+        
         logger.info(f"PPO Optimizer initialized with state_dim={state_dim}, action_dim={action_dim}")
     
     def _initialize_networks(self):
@@ -327,17 +580,23 @@ class PPOOptimizer:
             nn = torch_modules['nn']
             optim = torch_modules['optim']
             
-            # Initialize networks
-            self.policy_net = PolicyNetwork(self.state_dim, self.action_dim, self.hidden_dim).network
-            self.value_net = ValueNetwork(self.state_dim, self.hidden_dim).network
-            
-            # Move to appropriate device
-            self.policy_net = self.policy_net.to(self.device)
-            self.value_net = self.value_net.to(self.device)
-            
-            # Initialize optimizers
-            self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
-            self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=self.lr)
+            try:
+                # Initialize networks
+                self.policy_net = PolicyNetwork(self.state_dim, self.action_dim, self.hidden_dim).network
+                self.value_net = ValueNetwork(self.state_dim, self.hidden_dim).network
+                
+                # Move to appropriate device
+                self.policy_net = self.policy_net.to(self.device)
+                self.value_net = self.value_net.to(self.device)
+                
+                # Initialize optimizers
+                self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
+                self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=self.lr)
+                
+                logger.info(f"Networks initialized on device: {self.device}")
+            except Exception as e:
+                logger.error(f"Failed to initialize networks: {e}")
+                raise
     
     def _create_action_mapping(self) -> Dict[int, Tuple[str, float]]:
         """
@@ -410,7 +669,8 @@ class PPOOptimizer:
         keywords = self._extract_keywords(scene.prompt)
         
         # Clear experience buffer
-        self.experiences = []
+        with self._experiences_lock:
+            self.experiences = []
         
         torch_modules = _load_torch()
         torch = torch_modules['torch']
@@ -424,18 +684,32 @@ class PPOOptimizer:
                 # Generate population of SVGs using policy
                 population = self._generate_population(scene, current_params, keywords, population_size)
                 
+                # Memory checkpoint after generation
+                memory_manager.operation_checkpoint()
+                
                 # Collect experiences from population
                 experiences = self._collect_experiences(scene, population, current_params, keywords)
-                self.experiences.extend(experiences)
+                
+                # Add to experience buffer
+                with self._experiences_lock:
+                    self.experiences.extend(experiences)
                 
                 # Find best SVG in this population
-                best_in_population = max(population, key=lambda p: p["score"])
+                best_in_population = max(population, key=lambda p: p["score"]) if population else None
                 
-                # Update best overall
-                if best_in_population["score"] > best_score:
+                # Update best overall if we have a better one
+                if best_in_population and best_in_population["score"] > best_score:
                     best_score = best_in_population["score"]
                     best_svg = best_in_population["svg_code"]
                     best_params = best_in_population["params"].copy()
+                    
+                    # Update Hall of Fame
+                    self.hall_of_fame.add_entry(
+                        svg_code=best_svg,
+                        score=best_score,
+                        params=best_params,
+                        prompt=scene.prompt
+                    )
                     
                     # Call callback if provided
                     if callback:
@@ -444,22 +718,25 @@ class PPOOptimizer:
                     logger.info(f"New best score: {best_score:.4f} (improvement: +{best_score - base_score:.4f})")
                 
                 # Update policy if we have enough experiences
-                if len(self.experiences) >= self.batch_size:
-                    self._update_policy()
+                with self._experiences_lock:
+                    if len(self.experiences) >= self.batch_size:
+                        self._update_policy()
                     
                 # Sample new parameters from policy
                 state = self._get_state(scene, best_svg, best_params, keywords)
-                current_params = self._sample_parameters(state)
+                current_params = self._sample_parameters(state, keywords)
                 
                 iteration_time = time.time() - iteration_start
                 logger.info(f"Completed iteration {iteration+1} in {iteration_time:.2f}s. "
                            f"Current best score: {best_score:.4f}")
                 
-                # Free up memory
+                # Memory checkpoint
                 memory_manager.operation_checkpoint()
         
-        # Free resources
-        torch.cuda.empty_cache() if self.device == 'cuda' and hasattr(torch.cuda, 'empty_cache') else None
+        # Free up resources
+        self._experience_processor.stop(wait_complete=False)
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
         
         return best_svg, best_score
     
@@ -526,30 +803,43 @@ class PPOOptimizer:
             state = self._get_state(scene, None, base_params, keywords)
             
             # Use batch processor for parallel generation
-            batch_items = []
+            generation_tasks = []
+            
             for i in range(population_size):
                 # Sample parameters from policy
-                params = self._sample_parameters(state)
-                batch_items.append((scene, params, keywords, f"candidate_{i}"))
-                
-            # Process batch
-            thread_pool = get_thread_pool()
+                params = self._sample_parameters(state, keywords)
+                generation_tasks.append((scene, params, keywords, f"candidate_{i}"))
             
-            # Submit tasks
+            # Process tasks in parallel
             futures = []
-            for item in batch_items:
-                futures.append(thread_pool.submit(self._generate_and_evaluate_svg, *item))
-                
+            for task in generation_tasks:
+                self._experience_processor.add_item(
+                    f"gen_task_{id(task)}",
+                    task,
+                    priority=2  # Higher priority for generation
+                )
+                futures.append(f"gen_task_{id(task)}")
+            
             # Collect results
             population = []
-            for future in futures:
-                try:
-                    result = future.result()
+            
+            for future_id in futures:
+                result = self._experience_processor.get_result(future_id, timeout=30.0)
+                if result:
+                    population.append(result)
+            
+            # Fill in any missing slots with sequential generation
+            if len(population) < population_size:
+                remaining = population_size - len(population)
+                logger.info(f"Generating {remaining} additional candidates sequentially")
+                
+                for i in range(remaining):
+                    params = self._sample_parameters(state, keywords)
+                    result = self._generate_and_evaluate_svg(scene, params, keywords, f"seq_candidate_{i}")
                     if result:
                         population.append(result)
-                except Exception as e:
-                    logger.error(f"Error generating population item: {e}")
-                    
+            
+            logger.info(f"Generated population of {len(population)} candidates")
             return population
     
     def _generate_and_evaluate_svg(self, scene: Scene, params: Dict[str, Any], 
@@ -577,12 +867,13 @@ class PPOOptimizer:
             logger.error(f"Error in SVG generation and evaluation: {e}")
             return None
     
-    def _sample_parameters(self, state: np.ndarray) -> Dict[str, Any]:
+    def _sample_parameters(self, state: np.ndarray, keywords: List[str]) -> Dict[str, Any]:
         """
         Sample parameters using the current policy.
         
         Args:
             state: Current state
+            keywords: Available keywords for focus
             
         Returns:
             Dictionary of sampled parameters
@@ -590,32 +881,48 @@ class PPOOptimizer:
         # Start with default parameters
         params = self._get_default_parameters()
         
+        # Try to use a Hall of Fame entry as inspiration occasionally
+        if random.random() < 0.2:  # 20% chance
+            hof_entry = self.hall_of_fame.get_random_entry()
+            if hof_entry:
+                # Copy some parameters from successful entry
+                for key in ["detail_level", "style_weight", "use_gradients", "use_patterns", "use_effects"]:
+                    if key in hof_entry.params:
+                        params[key] = hof_entry.params[key]
+                        
+                logger.debug("Using Hall of Fame entry as parameter inspiration")
+        
         # Lazy load torch modules
         torch_modules = _load_torch()
         torch = torch_modules['torch']
         Categorical = torch_modules['Categorical']
         
         # Convert state to tensor
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        
-        # Sample action from policy
-        with torch.no_grad():
-            action_probs = self.policy_net(state_tensor)
-            dist = Categorical(action_probs)
-            action = dist.sample().item()
-        
-        # Apply action to modify parameters
-        param_name, delta = self.action_mapping[action]
-        
-        if param_name in ["temperature", "detail_level", "style_weight"]:
-            # Apply delta to continuous parameter
-            params[param_name] = min(1.0, max(0.1, params[param_name] + delta))
-        elif param_name in ["use_gradients", "use_patterns", "use_effects"]:
-            # Toggle boolean parameter
-            params[param_name] = not params[param_name]
-        elif param_name == "focus_keyword" and keywords:
-            # Set focus keyword index
-            params[param_name] = min(len(keywords) - 1, max(0, action % len(keywords)))
+        try:
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            
+            # Sample action from policy
+            with torch.no_grad():
+                action_probs = self.policy_net(state_tensor)
+                dist = Categorical(action_probs)
+                action = dist.sample().item()
+            
+            # Apply action to modify parameters
+            if action in self.action_mapping:
+                param_name, delta = self.action_mapping[action]
+                
+                if param_name in ["temperature", "detail_level", "style_weight"]:
+                    # Apply delta to continuous parameter
+                    params[param_name] = min(1.0, max(0.1, params[param_name] + delta))
+                elif param_name in ["use_gradients", "use_patterns", "use_effects"]:
+                    # Toggle boolean parameter
+                    params[param_name] = not params[param_name]
+                elif param_name == "focus_keyword" and keywords:
+                    # Set focus keyword index
+                    params[param_name] = min(len(keywords) - 1, max(0, action % len(keywords)))
+        except Exception as e:
+            logger.error(f"Error sampling parameters: {e}")
+            # Return default parameters on error
         
         return params
     
@@ -637,6 +944,12 @@ class PPOOptimizer:
         with Profiler("svg_generation"):
             # Create generation prompt
             prompt = self._create_generation_prompt(scene, params, keywords)
+            
+            # Get inspiration from Hall of Fame occasionally
+            if random.random() < 0.3:  # 30% chance
+                hof_entry = self.hall_of_fame.get_best_entry(scene.prompt)
+                if hof_entry:
+                    prompt += f"\n\nHere's an example of a high-quality SVG for inspiration (you can use similar techniques but create a different design):\n```xml\n{hof_entry.svg_code}\n```"
             
             # Generate SVG using LLM
             try:
@@ -716,6 +1029,13 @@ Focus on creating an SVG that:
 
 The SVG should be semantically meaningful and directly represent the elements in the prompt.
 
+Technical requirements:
+1. All colors should have good contrast
+2. Use vector shapes appropriate for the content
+3. Ensure proper layering of elements
+4. Optimize SVG code for performance and file size
+5. Make all paths and shapes fully enclosed and valid
+
 Create complete SVG code:
 ```xml
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
@@ -739,32 +1059,21 @@ Create complete SVG code:
         Returns:
             Extracted SVG code
         """
-        import re
+        # Use the utility function from LLM manager
+        svg_code = extract_svg_from_text(llm_response)
         
-        # Look for SVG code in code blocks
-        svg_match = re.search(r'```(?:xml|svg)?\s*((?:<\?xml|<svg).*?</svg>)', llm_response, re.DOTALL)
-        if svg_match:
-            return svg_match.group(1).strip()
+        if svg_code:
+            return svg_code
             
-        # If no explicit code block, try to find SVG tags directly
-        svg_match = re.search(r'(?:<\?xml|<svg).*?</svg>', llm_response, re.DOTALL)
-        if svg_match:
-            return svg_match.group(0).strip()
-            
-        # If still no match, check if response starts with XML declaration or SVG tag
-        if llm_response.strip().startswith(('<?xml', '<svg')):
-            # Find the closing SVG tag
-            if '</svg>' in llm_response:
-                end_index = llm_response.rindex('</svg>') + 6
-                return llm_response[:end_index].strip()
+        # If extraction failed, return a minimal valid SVG as fallback
+        logger.warning("Failed to extract SVG code from LLM response")
         
-        # Return a minimal valid SVG as fallback
         return f"""
-<svg width="{800}" height="{600}" viewBox="0 0 800 600"
+<svg width="800" height="600" viewBox="0 0 800 600"
     xmlns="http://www.w3.org/2000/svg">
     <rect width="100%" height="100%" fill="#F5F5F5" />
     <text x="400" y="300" text-anchor="middle" font-size="24" fill="#333">
-        {scene.prompt if hasattr(scene, 'prompt') else "Fallback SVG"}
+        Fallback SVG
     </text>
 </svg>
 """
@@ -795,13 +1104,13 @@ Create complete SVG code:
         
         # Add parameter values to state
         param_indices = {
-            "temperature": 10,
-            "detail_level": 11,
-            "style_weight": 12,
-            "use_gradients": 13,
-            "use_patterns": 14,
-            "use_effects": 15,
-            "focus_keyword": 16
+            "temperature": 16,
+            "detail_level": 17,
+            "style_weight": 18,
+            "use_gradients": 19,
+            "use_patterns": 20,
+            "use_effects": 21,
+            "focus_keyword": 22
         }
         
         for param, idx in param_indices.items():
@@ -831,6 +1140,9 @@ Create complete SVG code:
             List of experiences
         """
         with Profiler("collect_experiences"):
+            if not population:
+                return []
+                
             # Sort population by score
             sorted_population = sorted(population, key=lambda p: p["score"], reverse=True)
             
@@ -838,25 +1150,53 @@ Create complete SVG code:
             batch_items = [(scene, candidate, current_params, keywords, i)
                          for i, candidate in enumerate(sorted_population)]
             
-            # Use thread pool for parallel processing
-            thread_pool = get_thread_pool()
-            futures = []
+            # Add tasks to processor
+            for i, item in enumerate(batch_items):
+                self._experience_processor.add_item(
+                    f"exp_task_{id(item)}",
+                    item,
+                    priority=1  # Standard priority
+                )
             
-            for item in batch_items:
-                futures.append(thread_pool.submit(self._process_experience, *item))
-                
             # Collect experiences
             experiences = []
-            for future in futures:
-                try:
-                    experience = future.result()
+            
+            # Wait for all results with timeout
+            timeout = max(30.0, len(batch_items) * 2.0)  # 2 seconds per item, min 30 seconds
+            start_time = time.time()
+            
+            # Process sequentially for small batches, otherwise use parallel
+            if len(batch_items) <= 2:
+                # Direct processing for small batches
+                for item in batch_items:
+                    experience = self._process_experience(*item)
                     if experience:
                         experiences.append(experience)
-                except Exception as e:
-                    logger.error(f"Error processing experience: {e}")
+            else:
+                # Parallel processing for larger batches
+                for i, item in enumerate(batch_items):
+                    task_id = f"exp_task_{id(item)}"
+                    
+                    # Check time remaining
+                    if time.time() - start_time > timeout:
+                        logger.warning("Experience collection timeout reached")
+                        break
+                        
+                    # Get result with short timeout
+                    result = self._experience_processor.get_result(task_id, timeout=5.0)
+                    
+                    if result:
+                        experiences.append(result)
+                    else:
+                        # Fall back to direct processing
+                        experience = self._process_experience(*item)
+                        if experience:
+                            experiences.append(experience)
             
+            logger.info(f"Collected {len(experiences)} experiences")
             return experiences
     
+    @memory_manager.memory_efficient_function
     def _process_experience(self, scene: Scene, candidate: Dict[str, Any], 
                           current_params: Dict[str, Any], keywords: List[str], index: int) -> Experience:
         """Process a single experience (for parallel processing)."""
@@ -960,8 +1300,9 @@ Create complete SVG code:
     def _update_policy(self) -> None:
         """Update policy and value networks using PPO."""
         # Skip update if not enough experiences
-        if len(self.experiences) < self.batch_size:
-            return
+        with self._experiences_lock:
+            if len(self.experiences) < self.batch_size:
+                return
         
         with Profiler("update_policy"):
             logger.info(f"Updating policy with {len(self.experiences)} experiences")
@@ -972,105 +1313,128 @@ Create complete SVG code:
             F = torch_modules['F']
             Categorical = torch_modules['Categorical']
             
-            # Sample batch
-            batch_indices = random.sample(range(len(self.experiences)), self.batch_size)
-            batch = [self.experiences[i] for i in batch_indices]
-            
-            # Prepare batch data
-            states = torch.FloatTensor([exp.state for exp in batch]).to(self.device)
-            actions = torch.LongTensor([exp.action for exp in batch]).to(self.device)
-            rewards = torch.FloatTensor([exp.reward for exp in batch]).to(self.device)
-            log_probs_old = torch.FloatTensor([exp.log_prob for exp in batch]).to(self.device)
-            values_old = torch.FloatTensor([exp.value for exp in batch]).to(self.device)
-            
-            # Normalize rewards
-            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-            
-            # Compute advantages
-            advantages = rewards - values_old
-            
-            # Optimize for multiple epochs
-            for _ in range(self.update_epochs):
-                # Get action probabilities and values
-                action_probs = self.policy_net(states)
-                values = self.value_net(states).squeeze()
+            try:
+                # Sample batch
+                with self._experiences_lock:
+                    batch_indices = random.sample(range(len(self.experiences)), self.batch_size)
+                    batch = [self.experiences[i] for i in batch_indices]
                 
-                # Calculate log probabilities
-                dist = Categorical(action_probs)
-                log_probs = dist.log_prob(actions)
+                # Prepare batch data
+                states = torch.FloatTensor([exp.state for exp in batch]).to(self.device)
+                actions = torch.LongTensor([exp.action for exp in batch]).to(self.device)
+                rewards = torch.FloatTensor([exp.reward for exp in batch]).to(self.device)
+                log_probs_old = torch.FloatTensor([exp.log_prob for exp in batch]).to(self.device)
+                values_old = torch.FloatTensor([exp.value for exp in batch]).to(self.device)
                 
-                # Calculate entropy
-                entropy = dist.entropy().mean()
+                # Normalize rewards for stability
+                if len(rewards) > 1:
+                    rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
                 
-                # Calculate ratio for PPO
-                ratio = torch.exp(log_probs - log_probs_old)
+                # Compute advantages
+                advantages = rewards - values_old
                 
-                # Calculate surrogate losses
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon) * advantages
+                # Optimize for multiple epochs
+                for epoch in range(self.update_epochs):
+                    # Get action probabilities and values
+                    action_probs = self.policy_net(states)
+                    values = self.value_net(states).squeeze()
+                    
+                    # Calculate log probabilities
+                    dist = Categorical(action_probs)
+                    log_probs = dist.log_prob(actions)
+                    
+                    # Calculate entropy
+                    entropy = dist.entropy().mean()
+                    
+                    # Calculate ratio for PPO
+                    ratio = torch.exp(log_probs - log_probs_old)
+                    
+                    # Calculate surrogate losses
+                    surr1 = ratio * advantages
+                    surr2 = torch.clamp(ratio, 1.0 - self.epsilon, 1.0 + self.epsilon) * advantages
+                    
+                    # Calculate policy loss
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    
+                    # Calculate value loss
+                    value_loss = F.mse_loss(values, rewards)
+                    
+                    # Total loss
+                    loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+                    
+                    # Update policy network
+                    self.policy_optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.max_grad_norm)
+                    self.policy_optimizer.step()
+                    
+                    # Update value network
+                    self.value_optimizer.zero_grad()
+                    value_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
+                    self.value_optimizer.step()
                 
-                # Calculate policy loss
-                policy_loss = -torch.min(surr1, surr2).mean()
+                # Clear experience buffer
+                with self._experiences_lock:
+                    self.experiences = []
                 
-                # Calculate value loss
-                value_loss = F.mse_loss(values, rewards)
+                # Force garbage collection
+                gc.collect()
                 
-                # Total loss
-                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+                logger.info("Policy updated successfully")
                 
-                # Update policy network
-                self.policy_optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.max_grad_norm)
-                self.policy_optimizer.step()
-                
-                # Update value network
-                self.value_optimizer.zero_grad()
-                value_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
-                self.value_optimizer.step()
-            
-            # Clear experience buffer
-            self.experiences = []
-            
-            # Force garbage collection
-            gc.collect()
-            
-            logger.info("Policy updated successfully")
+            except Exception as e:
+                logger.error(f"Error updating policy: {e}")
+                # Clear experiences on error to avoid repeating problematic data
+                with self._experiences_lock:
+                    self.experiences = []
     
-    def save_models(self, path: str) -> None:
+    def save_models(self, path: Optional[str] = None) -> None:
         """
         Save policy and value networks.
         
         Args:
-            path: Path to save models
+            path: Path to save models (defaults to cache_dir)
         """
         if not self.policy_net or not self.value_net:
             logger.warning("No models to save - networks not initialized")
             return
             
-        os.makedirs(path, exist_ok=True)
+        save_path = path or os.path.join(self.cache_dir, "models")
+        os.makedirs(save_path, exist_ok=True)
         
         # Lazy load torch
         torch_modules = _load_torch()
         torch = torch_modules['torch']
         
-        # Save policy network
-        policy_path = os.path.join(path, "policy_net.pt")
-        torch.save(self.policy_net.state_dict(), policy_path)
-        
-        # Save value network
-        value_path = os.path.join(path, "value_net.pt")
-        torch.save(self.value_net.state_dict(), value_path)
-        
-        logger.info(f"Models saved to {path}")
+        try:
+            # Save policy network
+            policy_path = os.path.join(save_path, "policy_net.pt")
+            torch.save(self.policy_net.state_dict(), policy_path)
+            
+            # Save value network
+            value_path = os.path.join(save_path, "value_net.pt")
+            torch.save(self.value_net.state_dict(), value_path)
+            
+            # Save action mapping
+            with open(os.path.join(save_path, "action_mapping.json"), "w") as f:
+                # Convert tuples to lists for JSON serialization
+                serialized_mapping = {
+                    str(k): [v[0], float(v[1]) if isinstance(v[1], (int, float)) else v[1]] 
+                    for k, v in self.action_mapping.items()
+                }
+                json.dump(serialized_mapping, f, indent=2)
+            
+            logger.info(f"Models saved to {save_path}")
+        except Exception as e:
+            logger.error(f"Error saving models: {e}")
     
-    def load_models(self, path: str) -> bool:
+    def load_models(self, path: Optional[str] = None) -> bool:
         """
         Load policy and value networks.
         
         Args:
-            path: Path to load models from
+            path: Path to load models from (defaults to cache_dir)
             
         Returns:
             Whether loading was successful
@@ -1082,16 +1446,34 @@ Create complete SVG code:
         torch_modules = _load_torch()
         torch = torch_modules['torch']
         
+        load_path = path or os.path.join(self.cache_dir, "models")
+        
         try:
+            # Check for model files
+            policy_path = os.path.join(load_path, "policy_net.pt")
+            value_path = os.path.join(load_path, "value_net.pt")
+            
+            if not os.path.exists(policy_path) or not os.path.exists(value_path):
+                logger.warning(f"Model files not found in {load_path}")
+                return False
+            
             # Load policy network
-            policy_path = os.path.join(path, "policy_net.pt")
             self.policy_net.load_state_dict(torch.load(policy_path, map_location=self.device))
             
             # Load value network
-            value_path = os.path.join(path, "value_net.pt")
             self.value_net.load_state_dict(torch.load(value_path, map_location=self.device))
             
-            logger.info(f"Models loaded from {path}")
+            # Try to load action mapping
+            mapping_path = os.path.join(load_path, "action_mapping.json")
+            if os.path.exists(mapping_path):
+                with open(mapping_path, "r") as f:
+                    serialized_mapping = json.load(f)
+                    # Convert back to the expected format
+                    self.action_mapping = {
+                        int(k): (v[0], v[1]) for k, v in serialized_mapping.items()
+                    }
+            
+            logger.info(f"Models loaded from {load_path}")
             return True
             
         except Exception as e:
@@ -1108,29 +1490,60 @@ Create complete SVG code:
         Returns:
             Optimal device
         """
-        # Lazy load torch
-        torch_modules = _load_torch()
-        torch = torch_modules['torch']
-        
         if device != "auto":
             return device
             
-        if torch.cuda.is_available():
-            return "cuda"
-        elif hasattr(torch, 'mps') and torch.mps.is_available():
-            return "mps"
-        else:
-            return "cpu"
+        # Use hardware manager to get optimal device
+        return hardware_manager.get_optimal_device()
             
-    def cleanup(self):
+    def cleanup(self) -> None:
         """Free resources when done."""
-        if self.policy_net is not None and hasattr(self, 'device') and self.device == 'cuda':
-            # Lazy load torch
+        logger.info("Cleaning up PPOOptimizer resources")
+        
+        # Stop batch processor
+        if hasattr(self, '_experience_processor'):
+            self._experience_processor.stop(wait_complete=True)
+        
+        # Clear experiences
+        with self._experiences_lock:
+            self.experiences = []
+            
+        # Free GPU memory if using CUDA
+        if self.device == 'cuda' and hasattr(self, 'policy_net') and self.policy_net is not None:
             torch_modules = _load_torch()
             torch = torch_modules['torch']
             
             if hasattr(torch.cuda, 'empty_cache'):
                 torch.cuda.empty_cache()
                 
-        self.experiences = []
+        # Force garbage collection
         gc.collect()
+
+
+# Create singleton instance for easy import
+_default_ppo_optimizer = None
+
+def get_default_ppo_optimizer() -> PPOOptimizer:
+    """Get default PPO optimizer instance."""
+    global _default_ppo_optimizer
+    if _default_ppo_optimizer is None:
+        _default_ppo_optimizer = PPOOptimizer()
+    return _default_ppo_optimizer
+
+
+# Utility functions for direct use
+def optimize_svg(scene: Scene, base_svg: str, max_iterations: int = 10, population_size: int = 8, callback: Optional[Callable] = None) -> Tuple[str, float]:
+    """
+    Optimize SVG generation using PPO.
+    
+    Args:
+        scene: Scene to optimize
+        base_svg: Initial SVG code
+        max_iterations: Maximum number of iterations
+        population_size: Population size per iteration
+        callback: Optional callback function for progress updates
+        
+    Returns:
+        Tuple of (best_svg_code, best_score)
+    """
+    return get_default_ppo_optimizer().optimize(scene, base_svg, max_iterations, population_size, callback)

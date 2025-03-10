@@ -27,7 +27,6 @@ from svg_prompt_analyzer.llm_integration.llm_manager import LLMManager
 from svg_prompt_analyzer.llm_integration.llm_prompt_analyzer import LLMPromptAnalyzer
 from svg_prompt_analyzer.llm_integration.llm_svg_generator import LLMSVGGenerator
 from svg_prompt_analyzer.llm_integration.clip_evaluator import CLIPEvaluator
-from svg_prompt_analyzer.llm_integration.rl_optimizer import RLOptimizer
 from svg_prompt_analyzer.utils.logger import setup_logger
 
 logger = logging.getLogger(__name__)

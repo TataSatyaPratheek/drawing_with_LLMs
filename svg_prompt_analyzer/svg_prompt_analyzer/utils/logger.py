@@ -18,8 +18,8 @@ from functools import wraps
 import threading
 import socket
 
-# Import core optimizations
-from core import CONFIG, get_thread_pool
+# Import core optimizations - FIX: Use package-relative import
+from svg_prompt_analyzer.core import CONFIG, get_thread_pool
 
 # Constants
 DEFAULT_LOG_LEVEL = logging.INFO
@@ -203,9 +203,59 @@ def setup_logging(
     return logger
 
 
+def setup_logger(
+    level: str = None,
+    log_file: Optional[str] = None,
+    console: bool = True,
+    format_str: Optional[str] = None
+) -> None:
+    """
+    Configure the root logger for the application.
+    
+    Args:
+        level: Logging level
+        log_file: Optional file to log to
+        console: Whether to log to console
+        format_str: Optional custom format string
+    """
+    # Get log level
+    level_value = getattr(logging, level.upper(), logging.INFO) if level else logging.INFO
+    
+    # Get format string
+    format_str = format_str or LOG_FORMAT
+    formatter = logging.Formatter(format_str)
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level_value)
+    
+    # Remove existing handlers to avoid duplicates
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Add console handler if requested
+    if console:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        console_handler.setLevel(level_value)
+        root_logger.addHandler(console_handler)
+    
+    # Add file handler if provided
+    if log_file:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=MAX_LOG_SIZE,
+            backupCount=BACKUP_COUNT
+        )
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(level_value)
+        root_logger.addHandler(file_handler)
+
+
 def get_logger(name: str) -> logging.Logger:
     """
-    Get a logger with the given name, creating it if it doesn't exist.
+    Get a logger with the given name.
     
     Args:
         name: Logger name
